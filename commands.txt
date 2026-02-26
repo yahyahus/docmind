@@ -1,0 +1,14 @@
+To create a virtual environment(That (venv) prefix means it worked. Every time you open this project in a new terminal session, you need to run this activation command first. This is the #1 thing beginners forget.):
+python -m venv venv
+
+To run the project:
+uvicorn main:app --reload
+
+Part 2 — A simple mental model you can say out loud
+Every time you open this project, ask yourself these 3 questions:
+"Where does a request come in?"
+Always main.py → the function under the matching @app.get or @app.post decorator.
+"Where does data live?"
+Right now: in memory (a Python list inside main.py). Soon: PostgreSQL database via database.py.
+"Where does business logic go?"
+Inside the endpoint functions for now. Later we'll move complex logic into separate service files.

@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: docmind-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+```
+
+**What each line does:**
+- `type: web` — this is a web server, not a background job
+- `buildCommand` — runs once when deploying, installs all packages
+- `startCommand` — runs your server, `$PORT` is assigned by Render automatically
+- `envVars` — tells Render these variables exist but values are set manually (sync: false means don't hardcode them here)
+
+---

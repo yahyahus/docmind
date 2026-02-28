@@ -4,30 +4,27 @@ ROLE: The data layer. Defines what data looks like and how to connect to it.
 
 WHAT THIS FILE DOES:
 - Creates the connection to Supabase PostgreSQL
-- Defines database tables as Python classes (called models)
+- Defines all database tables as Python classes (models)
 - Provides get_db() which gives each request its own DB session
 - Auto-creates tables on startup if they don't exist
+
+TABLE RELATIONSHIPS:
+users (1) ──── documents (many)
+users (1) ──── conversations (many)
+conversations (1) ──── messages (many)
+conversations (many) ──── documents (1) [optional]
+documents (1) ──── document_chunks (many)
 
 WHAT THIS FILE DOES NOT DO:
 - Does not define API endpoints (that's main.py)
 - Does not contain business logic
 - Does not handle auth (that's auth.py)
-
-KEY CONCEPTS:
-- engine = the actual connection to PostgreSQL
-- SessionLocal = a factory that creates DB sessions
-- Base = parent class all table models inherit from
-- get_db() = dependency that opens/closes a session per request
-
-TABLE RELATIONSHIPS:
-users (one) ──── documents (many)
-One user can have many documents.
-documents.user_id is a foreign key pointing to users.id
 """
 
-from sqlalchemy import create_engine, Column, String, DateTime, ARRAY, Text, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, String, DateTime, ARRAY, Text, Boolean, ForeignKey, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 from datetime import datetime
 import uuid
@@ -47,12 +44,6 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# ─────────────────────────────────────────
-# USER TABLE
-# Stores registered users.
-# Passwords are never stored plain — only bcrypt hash is saved.
-# ─────────────────────────────────────────
-
 class User(Base):
     __tablename__ = "users"
 
@@ -63,15 +54,6 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-# ─────────────────────────────────────────
-# DOCUMENT TABLE
-# Stores document metadata + extracted text content.
-# The actual file lives in Supabase Storage.
-# file_path = the path inside Supabase Storage bucket
-# file_type = "pdf" or "txt"
-# content = extracted text (what AI will read later)
-# ─────────────────────────────────────────
-
 class Document(Base):
     __tablename__ = "documents"
 
@@ -80,17 +62,55 @@ class Document(Base):
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     tags = Column(ARRAY(String), default=[])
-    file_path = Column(String, nullable=True)   # path in Supabase Storage
-    file_type = Column(String, nullable=True)   # "pdf", "txt", or None if raw text
+    file_path = Column(String, nullable=True)
+    file_type = Column(String, nullable=True)
+    is_processed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ─────────────────────────────────────────
-# DATABASE SESSION DEPENDENCY
-# FastAPI calls this to get a DB session for each request.
-# try/finally ensures session always closes after request ends.
+# DOCUMENT CHUNK TABLE
+# Each document is split into small overlapping chunks.
+# Each chunk gets an embedding — a vector of 768 numbers
+# (Gemini embedding dimension is 768, OpenAI is 1536).
+# The embedding captures the semantic meaning of the chunk.
+# When a user asks a question, we embed the question too,
+# then find chunks whose embeddings are most similar.
 # ─────────────────────────────────────────
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    document_id = Column(String, ForeignKey("documents.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    chunk_index = Column(Integer, nullable=False)
+    embedding = Column(Vector(1536))   # Gemini uses 768 dimensions
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=True)
+    title = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id = Column(String, ForeignKey("conversations.id"), nullable=False)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 def get_db():
     db = SessionLocal()
@@ -100,5 +120,4 @@ def get_db():
         db.close()
 
 
-# Create all tables that don't exist yet
 Base.metadata.create_all(bind=engine)

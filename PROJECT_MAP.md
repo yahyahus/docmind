@@ -5,130 +5,155 @@ A full-stack AI platform where users upload documents (PDFs, text files)
 and can chat with them, get summaries, and search through them using AI.
 
 ## How a Request Flows Through the App
-Browser/Client → Uvicorn (server) → FastAPI (router) → Auth check → Your function → Database + Storage → Response
+Browser/Client → Uvicorn → FastAPI → Auth check → Your function → Database + Storage + AI → Response
 
 ## File Structure & Purpose
 
 ### Current Files
-- `main.py` — All API endpoints. Auth + document CRUD + file upload + search.
-- `database.py` — Database connection + User and Document table definitions.
-- `auth.py` — Password hashing (bcrypt), JWT creation, token decoding,
-              get_current_user dependency that protects endpoints.
-- `.env` — Supabase DB URL + Supabase API credentials + SECRET_KEY.
+- `main.py` — All API endpoints (15+ endpoints)
+- `database.py` — All 5 table definitions + DB connection
+- `auth.py` — JWT tokens + bcrypt password hashing
+- `ai.py` — RAG pipeline (chunking + embeddings + chat)
+- `.env` — DATABASE_URL, SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY
 - `.gitignore` — Ignores venv/, .env, __pycache__/
-- `venv/` — Isolated Python environment. Never touch manually.
-- `PROJECT_MAP.md` — This file.
-- `DECISIONS.md` — Why each tool and pattern was chosen.
-- `PROGRESS.md` — Daily log, roadblocks, skills unlocked.
-- `test_document.txt` — Test file for upload testing.
+- `render.yaml` — Render deployment config
+- `Procfile` — Production server start command
+- `requirements.txt` — All installed packages
+- `PROJECT_MAP.md` — This file
+- `DECISIONS.md` — Why each tool was chosen
+- `PROGRESS.md` — Daily log + roadblocks + skills
+- `CS_CONCEPTS.md` — Academic CS concepts applied
+- `test_small.txt` — AI fundamentals test document (~250 words, 1 chunk)
+- `test_medium.txt` — Software engineering test document (~600 words, 2 chunks)
+- `test_large.txt` — Computer networks test document (~1000 words, 3 chunks)
 
-### Files Coming Next
-- `requirements.txt` — List of all packages (needed for deployment)
+### Files Coming Next (Week 4)
+- `frontend/` — Next.js app directory
 
-## The Stack & Why
-- FastAPI — Python web framework. Handles routing, validation, auto docs.
-- Uvicorn — The actual server that listens for requests.
-- Pydantic — Validates data shapes. Turns Python objects into JSON.
-- SQLAlchemy — ORM. Talk to PostgreSQL using Python classes.
-- PostgreSQL (Supabase) — Permanent cloud database. Free tier.
-- Supabase Storage — File storage for uploaded PDFs and TXT files.
-- python-jose — Creates and decodes JWT tokens.
-- passlib + bcrypt — Hashes passwords securely. Never stores plain text.
-- PyPDF2 — Extracts text from uploaded PDF files.
-- Thunder Client — VS Code extension for testing API endpoints.
-- OpenAI API — The AI brain (Week 3).
-- Next.js — The frontend (Week 4).
+## The Stack
+- FastAPI — Python web framework
+- Uvicorn — ASGI server
+- Pydantic — Request/response validation
+- SQLAlchemy — ORM for PostgreSQL
+- PostgreSQL (Supabase) — Cloud database
+- pgvector — Vector similarity search extension
+- Supabase Storage — File storage
+- python-jose — JWT tokens
+- passlib + bcrypt — Password hashing
+- PyPDF2 — PDF text extraction
+- OpenAI — Embeddings + chat completions
+- Render — Backend hosting
+- Next.js + Vercel — Frontend (Week 4)
 
-## How File Upload Works (The Full Flow)
-1. User sends PDF or TXT to POST /documents/upload
-2. FastAPI reads raw file bytes into memory
-3. Text extracted (PyPDF2 for PDFs, decode() for TXT)
-4. File bytes uploaded to Supabase Storage bucket "documents"
-   Path: {user_id}/{uuid}/{filename}
-5. Document metadata + extracted text saved to PostgreSQL
-6. Response returned with full document object
+## How the RAG Pipeline Works
+```
+User asks question
+      ↓
+Question embedded → 1536-dimension vector
+      ↓
+pgvector finds chunks with closest cosine distance
+      ↓
+Top 5 relevant chunks retrieved as context
+      ↓
+Context + conversation history + question → GPT-4o-mini
+      ↓
+AI answers grounded in document — no hallucination
+      ↓
+Response saved as "assistant" message
+      ↓
+Returned to user
+```
 
-## How Search Works
-1. User sends GET /documents/search?q=keyword
-2. PostgreSQL ILIKE matches keyword against title, content, tags
-3. ILIKE = case-insensitive (finds "Python", "PYTHON", "python")
-4. Results filtered to current user's documents only
-5. Ordered by most recently updated first
+## Keyword Search vs Semantic Search
+- Keyword (ILIKE): matches exact words — "python" finds "python"
+- Semantic (pgvector): matches meaning — "weaknesses" finds "limitations"
 
 ## Critical Route Order Rule
-Specific routes MUST come before dynamic routes.
-/documents/search   ← specific, must be first
-/documents/{doc_id} ← dynamic, must be after
-If reversed, FastAPI treats "search" as a document ID → 404 every time.
+Specific routes before dynamic routes:
+/documents/search   ← first
+/documents/{doc_id} ← second
+/documents/upload   ← also before /{doc_id}
 
-## API Endpoints (Current)
-| Method | Path                  | What it does                   | Auth Required |
-|--------|-----------------------|--------------------------------|---------------|
-| GET    | /                     | Root check                     | No            |
-| GET    | /health               | Server status + counts         | No            |
-| POST   | /auth/register        | Create new user account        | No            |
-| POST   | /auth/login           | Login, returns JWT tokens      | No            |
-| GET    | /auth/me              | Get current logged-in user     | Yes           |
-| POST   | /documents            | Create document (raw text)     | Yes           |
-| GET    | /documents            | List your documents            | Yes           |
-| GET    | /documents/search     | Search documents by keyword    | Yes           |
-| GET    | /documents/{id}       | Get one document               | Yes           |
-| PATCH  | /documents/{id}       | Update a document              | Yes           |
-| DELETE | /documents/{id}       | Delete a document              | Yes           |
-| POST   | /documents/upload     | Upload PDF or TXT file         | Yes           |
-
-## Database (Supabase PostgreSQL)
-- Host: Supabase pooler (port 6543)
-- Tables: users, documents
-- documents.user_id is a foreign key → users.id
-- Every document is scoped to its owner
-
-## Database Schema
+## Database Schema (All 5 Tables)
+```
 users:
   id, email, hashed_password, is_active, created_at
 
 documents:
-  id, user_id (FK→users), title, content, tags,
-  file_path, file_type, created_at, updated_at
+  id, user_id(FK), title, content, tags,
+  file_path, file_type, is_processed, created_at, updated_at
+
+document_chunks:
+  id, document_id(FK), user_id(FK), content,
+  chunk_index, embedding(vector 1536), created_at
+
+conversations:
+  id, user_id(FK), document_id(FK nullable),
+  title, created_at, updated_at
+
+messages:
+  id, conversation_id(FK), role, content, created_at
+```
+
+## API Endpoints (Current — 15 Total)
+| Method | Path | What it does | Auth |
+|--------|------|--------------|------|
+| GET | / | Root check | No |
+| GET | /health | Server status | No |
+| POST | /auth/register | Create account | No |
+| POST | /auth/login | Login → JWT | No |
+| GET | /auth/me | Current user | Yes |
+| POST | /documents | Create document | Yes |
+| GET | /documents | List documents | Yes |
+| GET | /documents/search | Keyword search | Yes |
+| GET | /documents/{id} | Get document | Yes |
+| PATCH | /documents/{id} | Update document | Yes |
+| DELETE | /documents/{id} | Delete document | Yes |
+| POST | /documents/upload | Upload PDF/TXT | Yes |
+| POST | /documents/{id}/process | Chunk + embed | Yes |
+| GET | /documents/{id}/chunks | View chunks | Yes |
+| POST | /conversations | Create conversation | Yes |
+| GET | /conversations | List conversations | Yes |
+| GET | /conversations/{id} | Get conversation | Yes |
+| DELETE | /conversations/{id} | Delete + messages | Yes |
+| POST | /conversations/{id}/messages | Add message | Yes |
+| GET | /conversations/{id}/messages | Get history | Yes |
+| POST | /conversations/{id}/chat | AI chat (RAG) | Yes |
+
+## Environments
+| Environment | URL | Purpose |
+|-------------|-----|---------|
+| Local | http://localhost:8000 | Development |
+| Production | https://YOUR-APP.onrender.com | Live API |
 
 ## Storage Bucket Structure
+```
 documents/
 └── {user_id}/
     └── {uuid}/
         └── {filename}
-
-## Testing Tools
-- Swagger UI: http://localhost:8000/docs (use for file upload + general testing)
-- Thunder Client: VS Code extension (use for auth testing)
+```
 
 ## Where Do I Look When...
-| Situation | File to open |
-|-----------|-------------|
-| Adding a new API endpoint | main.py |
-| Changing what data is stored | database.py |
-| Fixing a login/token bug | auth.py |
-| Changing database credentials | .env |
-| Understanding why a tool was chosen | DECISIONS.md |
-| Remembering the project structure | PROJECT_MAP.md |
-| Tracking daily progress | PROGRESS.md |
-| A request returns 401 | auth.py → get_current_user() |
-| A request returns 404 | main.py → check route order first |
-| A request returns 500 | Read terminal error output first |
-| Adding a new database table | database.py → add a new class |
-| Changing response shape | main.py → update Pydantic response model |
-| Search returning 404 | main.py → check /search is above /{doc_id} |
+| Situation | File |
+|-----------|------|
+| Adding endpoint | main.py |
+| Changing data structure | database.py |
+| Auth bug | auth.py |
+| AI not working | ai.py |
+| Secrets | .env |
+| Why a tool was chosen | DECISIONS.md |
+| Daily progress | PROGRESS.md |
+| CS concepts | CS_CONCEPTS.md |
+| 401 error | auth.py → get_current_user() |
+| 404 error | main.py → check route order |
+| 422 error | Check JSON — strings need quotes |
+| 500 error | Read terminal output first |
+| AI hallucinating | ai.py → check system prompt rules |
+| Wrong chunks retrieved | ai.py → find_relevant_chunks() |
 
 ## Current State
-Week 1, Day 1 — Server running locally. 2 basic endpoints.
-Week 1, Day 1 — 7 CRUD endpoints built. In-memory storage. All tested in Swagger.
-Week 1, Day 2 — PostgreSQL connected via Supabase. Data persists. Documents table live.
-Week 1, Day 3 — JWT auth complete. Register, login, protected routes all working.
-Week 1, Day 3 — File upload complete. PDF + TXT → Storage + PostgreSQL working.
-Week 1, Day 4 — Search endpoint complete. Keyword search across title, content, tags.
-
-## Known Limitations Right Now
-- Keyword search only — semantic/AI search comes in Week 3
-- No AI integration yet
-- No refresh token endpoint yet
-- No frontend yet
-- Not deployed yet (coming next)
+Week 1 — Backend complete (12 endpoints, auth, file upload, search, deploy)
+Week 2 — Conversations + messages complete (6 more endpoints)
+Week 3 — AI complete (RAG pipeline, embeddings, semantic search, GPT-4o-mini)
+Week 4 — Next.js frontend starting next

@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.openapi.models import SecurityScheme
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -41,7 +42,8 @@ import io
 
 import PyPDF2
 
-from database import Document, User, get_db
+from ai import process_document, generate_rag_response
+from database import Document, User, Conversation, Message, DocumentChunk, get_db
 from auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
@@ -55,6 +57,21 @@ load_dotenv()
 # ─────────────────────────────────────────
 
 app = FastAPI(title="DocMind API", version="1.0.0")
+
+# ─────────────────────────────────────────
+# CORS MIDDLEWARE
+# Allows the frontend (different domain) to call this API.
+# Without this, browsers block all cross-origin requests.
+# origins = list of domains allowed to make requests.
+# In production, replace "*" with your actual Vercel URL.
+# ─────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # allow all origins for now
+    allow_credentials=True,
+    allow_methods=["*"],        # allow all HTTP methods
+    allow_headers=["*"],        # allow all headers
+)
 
 # Supabase client for file storage
 # We use this to upload files to Supabase Storage buckets
@@ -133,6 +150,42 @@ class DocumentResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# ─────────────────────────────────────────
+# CONVERSATION PYDANTIC MODELS
+# ─────────────────────────────────────────
+
+class ConversationCreate(BaseModel):
+    title: str
+    document_id: Optional[str] = None  # optional — can chat without a specific doc
+
+class ConversationResponse(BaseModel):
+    id: str
+    user_id: str
+    document_id: Optional[str] = None
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─────────────────────────────────────────
+# MESSAGE PYDANTIC MODELS
+# ─────────────────────────────────────────
+
+class MessageCreate(BaseModel):
+    content: str  # only content needed — role is always "user" when human sends
+
+class MessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+    role: str       # "user" or "assistant"
+    content: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 # ─────────────────────────────────────────
 # AUTH ENDPOINTS
@@ -459,3 +512,338 @@ async def upload_document(
             status_code=500,
             detail=f"Database save failed: {str(e)}"
         )
+    
+# ─────────────────────────────────────────
+# CONVERSATION ENDPOINTS
+# ─────────────────────────────────────────
+
+@app.post("/conversations", response_model=ConversationResponse, status_code=201)
+async def create_conversation(
+    conv: ConversationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Creates a new conversation for the logged-in user.
+    Optionally links to a specific document via document_id.
+    If document_id provided, verify it belongs to this user.
+    """
+    # If document_id provided, verify it belongs to this user
+    if conv.document_id:
+        doc = db.query(Document).filter(
+            Document.id == conv.document_id,
+            Document.user_id == current_user.id
+        ).first()
+        if not doc:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or does not belong to you"
+            )
+
+    db_conv = Conversation(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        document_id=conv.document_id,
+        title=conv.title
+    )
+    db.add(db_conv)
+    db.commit()
+    db.refresh(db_conv)
+    return db_conv
+
+
+@app.get("/conversations", response_model=list[ConversationResponse])
+async def list_conversations(
+    limit: int = 10,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Returns all conversations belonging to the logged-in user."""
+    return db.query(Conversation).filter(
+        Conversation.user_id == current_user.id
+    ).order_by(
+        Conversation.updated_at.desc()
+    ).offset(offset).limit(limit).all()
+
+
+@app.get("/conversations/{conv_id}", response_model=ConversationResponse)
+async def get_conversation(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Returns a single conversation by ID."""
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conv
+
+
+@app.delete("/conversations/{conv_id}")
+async def delete_conversation(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Deletes a conversation and ALL its messages.
+    Messages are deleted first because of foreign key constraint —
+    you can't delete a conversation that still has messages pointing to it.
+    """
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Delete all messages in this conversation first
+    db.query(Message).filter(
+        Message.conversation_id == conv_id
+    ).delete()
+
+    db.delete(conv)
+    db.commit()
+    return {"message": "Conversation and all messages deleted", "id": conv_id}
+
+
+# ─────────────────────────────────────────
+# MESSAGE ENDPOINTS
+# ─────────────────────────────────────────
+
+@app.post("/conversations/{conv_id}/messages",
+          response_model=MessageResponse,
+          status_code=201)
+async def add_message(
+    conv_id: str,
+    message: MessageCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Adds a user message to a conversation.
+    Role is always "user" here — AI responses come in Week 3.
+    In Week 3 this endpoint will also generate and save
+    an "assistant" message automatically.
+    """
+    # Verify conversation exists and belongs to this user
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Save the user message
+    db_message = Message(
+        id=str(uuid.uuid4()),
+        conversation_id=conv_id,
+        role="user",         # always "user" when human sends a message
+        content=message.content
+    )
+    db.add(db_message)
+
+    # Update conversation updated_at so it appears at top of list
+    conv.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(db_message)
+    return db_message
+
+
+@app.get("/conversations/{conv_id}/messages",
+         response_model=list[MessageResponse])
+async def get_messages(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Returns all messages in a conversation in chronological order.
+    This is the full chat history — oldest first.
+    In Week 3, this history gets sent to OpenAI as context.
+    """
+    # Verify conversation belongs to this user
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return db.query(Message).filter(
+        Message.conversation_id == conv_id
+    ).order_by(
+        Message.created_at.asc()   # oldest first = chronological order
+    ).all()
+
+# ─────────────────────────────────────────
+# AI ENDPOINTS
+# ─────────────────────────────────────────
+
+@app.post("/documents/{doc_id}/process")
+async def process_document_endpoint(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Processes a document for AI chat:
+    1. Splits content into chunks
+    2. Creates Gemini embeddings for each chunk
+    3. Stores chunks + embeddings in document_chunks table
+    Must be called before using AI chat on a document.
+    """
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if not doc.content:
+        raise HTTPException(
+            status_code=400,
+            detail="Document has no content to process"
+        )
+
+    try:
+        chunk_count = process_document(
+            document_id=doc_id,
+            user_id=current_user.id,
+            content=doc.content,
+            db=db
+        )
+        doc.is_processed = True
+        db.commit()
+
+        return {
+            "message": "Document processed successfully",
+            "document_id": doc_id,
+            "chunks_created": chunk_count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Processing failed: {str(e)}"
+        )
+
+
+@app.post("/conversations/{conv_id}/chat", response_model=MessageResponse)
+async def chat(
+    conv_id: str,
+    message: MessageCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Main AI chat endpoint — full RAG pipeline.
+    1. Saves user message
+    2. Finds relevant document chunks
+    3. Sends context + history + question to Gemini
+    4. Saves and returns AI response
+    """
+    import uuid as uuid_lib
+
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conv.document_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversation must be linked to a document. Include document_id when creating the conversation."
+        )
+
+    doc = db.query(Document).filter(
+        Document.id == conv.document_id
+    ).first()
+
+    if not doc.is_processed:
+        raise HTTPException(
+            status_code=400,
+            detail="Document not processed yet. Call POST /documents/{id}/process first."
+        )
+
+    # Save user message
+    user_message = Message(
+        id=str(uuid_lib.uuid4()),
+        conversation_id=conv_id,
+        role="user",
+        content=message.content
+    )
+    db.add(user_message)
+    db.commit()
+
+    # Generate AI response
+    try:
+        ai_response = generate_rag_response(
+            question=message.content,
+            document_id=conv.document_id,
+            user_id=current_user.id,
+            conversation_id=conv_id,
+            db=db
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI response failed: {str(e)}"
+        )
+
+    # Save assistant message
+    assistant_message = Message(
+        id=str(uuid_lib.uuid4()),
+        conversation_id=conv_id,
+        role="assistant",
+        content=ai_response
+    )
+    db.add(assistant_message)
+    conv.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(assistant_message)
+
+    return assistant_message
+
+
+@app.get("/documents/{doc_id}/chunks")
+async def get_document_chunks(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Returns all chunks for a document.
+    Useful for debugging — see exactly how your document was split.
+    """
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    chunks = db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == doc_id
+    ).order_by(DocumentChunk.chunk_index).all()
+
+    return {
+        "document_id": doc_id,
+        "is_processed": doc.is_processed,
+        "chunk_count": len(chunks),
+        "chunks": [
+            {
+                "index": c.chunk_index,
+                "preview": c.content[:200] + "..." if len(c.content) > 200 else c.content
+            }
+            for c in chunks
+        ]
+    }

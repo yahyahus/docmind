@@ -42,7 +42,7 @@ import io
 
 import PyPDF2
 
-from ai import process_document, generate_rag_response
+from ai import process_document, generate_rag_response, generate_summary
 from database import Document, User, Conversation, Message, DocumentChunk, get_db
 from auth import (
     hash_password, verify_password,
@@ -144,7 +144,10 @@ class DocumentResponse(BaseModel):
     title: str
     content: str
     tags: list[str]
+    file_path: Optional[str] = None
+    file_type: Optional[str] = None
     is_processed: bool = False
+    summary: Optional[str] = None  # add this
     created_at: datetime
     updated_at: datetime
 
@@ -692,13 +695,6 @@ async def process_document_endpoint(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Processes a document for AI chat:
-    1. Splits content into chunks
-    2. Creates Gemini embeddings for each chunk
-    3. Stores chunks + embeddings in document_chunks table
-    Must be called before using AI chat on a document.
-    """
     doc = db.query(Document).filter(
         Document.id == doc_id,
         Document.user_id == current_user.id
@@ -708,10 +704,7 @@ async def process_document_endpoint(
         raise HTTPException(status_code=404, detail="Document not found")
 
     if not doc.content:
-        raise HTTPException(
-            status_code=400,
-            detail="Document has no content to process"
-        )
+        raise HTTPException(status_code=400, detail="Document has no content to process")
 
     try:
         chunk_count = process_document(
@@ -720,20 +713,22 @@ async def process_document_endpoint(
             content=doc.content,
             db=db
         )
+
+        # Generate summary automatically
+        summary = generate_summary(doc.content)
+        doc.summary = summary
         doc.is_processed = True
         db.commit()
 
         return {
             "message": "Document processed successfully",
             "document_id": doc_id,
-            "chunks_created": chunk_count
+            "chunks_created": chunk_count,
+            "summary": summary
         }
 
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
 @app.post("/conversations/{conv_id}/chat", response_model=MessageResponse)

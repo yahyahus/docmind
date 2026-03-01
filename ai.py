@@ -206,3 +206,24 @@ DOCUMENT CONTEXT:
     )
 
     return response.choices[0].message.content
+
+def generate_summary(content: str) -> str:
+    """
+    Generates a concise 3-sentence summary of the document.
+    Called automatically after processing.
+    """
+    prompt = f"""Summarize the following document in exactly 3 sentences.
+Be specific about the main topics covered. Be concise.
+
+Document:
+{content[:3000]}
+
+Summary:"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.3
+    )
+    return response.choices[0].message.content.strip()

@@ -6,9 +6,8 @@
 | Week 1 | Backend (API + DB + Auth + File Upload + Search + Deploy) | ✅ Complete |
 | Week 2 | Conversations + Messages | ✅ Complete |
 | Week 3 | AI Integration (Embeddings + RAG pipeline) | ✅ Complete |
-| Week 4 | Next.js Frontend | 🔄 Starting Next |
-| Week 5 | Polish + Deployment | ⏳ Pending |
-| Week 6 | Resume prep + Interview prep | ⏳ Pending |
+| Week 4 | Next.js Frontend + Vercel Deploy | ✅ Complete |
+| Week 5 | Feature Additions | 🔄 Starting Next |
 
 ---
 
@@ -131,6 +130,38 @@
 
 ---
 
+### Day 7
+**Status:** ✅ Complete
+**What was built:**
+- Next.js app with TypeScript + Tailwind
+- lib/api.ts — axios client with JWT interceptor + cold start awareness
+- lib/wakeup.ts — backend ping on app load
+- app/layout.tsx — root layout with DocMind title
+- app/page.tsx — root redirect based on token
+- app/login/page.tsx — login form with error handling
+- app/register/page.tsx — register form with validation
+- app/dashboard/page.tsx — document list, upload, process, search, delete, chat
+- app/chat/[id]/page.tsx — full chat UI with typing indicator
+- No duplicate conversations — reuses existing conversation per document
+- Deployed to Vercel — live at docmind-frontend-eight.vercel.app
+- CORS middleware added to backend
+- is_processed added to DocumentResponse Pydantic model
+- Cold start handling — wakeup ping + retry button + helpful error messages
+
+**Time spent:** ~5-6 hrs
+**Roadblocks:**
+| # | Roadblock | Cause | Fix |
+|---|-----------|-------|-----|
+| 1 | Render build failed | Gemini packages conflicting | Manually removed from requirements.txt |
+| 2 | Render deploy failed | OPENAI_API_KEY not set on Render | Added to Render environment variables |
+| 3 | Login page refreshing on error | 401 interceptor doing hard redirect on login page | Added pathname check to interceptor |
+| 4 | All files merged into one | Copy-paste mistake | Separated into correct files |
+| 5 | Process for AI not updating UI | is_processed missing from DocumentResponse | Added field to Pydantic model |
+| 6 | Chat not finding SOLID principles | Only mentioned once in document | Expected RAG behavior, not a bug |
+| 7 | tsx vs js confusion | TypeScript selected by default | Used .tsx throughout |
+
+---
+
 ## Roadblocks Master Log
 | Day | Roadblock | Time Lost | Fix |
 |-----|-----------|-----------|-----|
@@ -148,11 +179,76 @@
 | 4 | JSON decode error | 5 min | Added quotes to strings |
 | 5 | Nested route path param | 10 min | Learned pattern |
 | 6 | Deprecated Gemini package | 15 min | Switched to google-genai |
-| 6 | Wrong embedding model name | 10 min | Used list_models() to find correct name |
+| 6 | Wrong embedding model name | 10 min | Used list_models() |
 | 6 | Vector dimension 768 vs 3072 | 15 min | Updated code + ALTER TABLE |
 | 6 | Gemini region restriction | 30 min | Switched to OpenAI |
 | 6 | OpenAI billing UI changed | 10 min | Found in settings |
 | 6 | Vector dimension 3072 vs 1536 | 10 min | Updated code + ALTER TABLE |
+| 7 | Gemini packages in requirements | 20 min | Manually removed lines |
+| 7 | OPENAI_API_KEY not on Render | 10 min | Added env var on Render |
+| 7 | 401 interceptor causing reload | 30 min | Added pathname check |
+| 7 | Files merged into one | 20 min | Separated correctly |
+| 7 | is_processed missing from response | 15 min | Added to Pydantic model |
+
+---
+
+## Skills Unlocked
+- [x] FastAPI server setup
+- [x] Pydantic models
+- [x] REST API design (CRUD)
+- [x] PostgreSQL + SQLAlchemy ORM
+- [x] Cloud database (Supabase)
+- [x] Environment variables (.env)
+- [x] JWT authentication from scratch
+- [x] bcrypt password hashing
+- [x] Dependency injection (Depends())
+- [x] API testing (Thunder Client + Swagger)
+- [x] File upload (PDF + TXT)
+- [x] Cloud file storage (Supabase Storage)
+- [x] PDF text extraction (PyPDF2)
+- [x] Database migrations (ALTER TABLE)
+- [x] Keyword search (PostgreSQL ILIKE)
+- [x] FastAPI route ordering rules
+- [x] Production deployment (Render)
+- [x] Environment variable management in production
+- [x] Relational data modeling (5 tables)
+- [x] Foreign key relationships + cascading delete
+- [x] Text chunking with overlap
+- [x] Vector embeddings (OpenAI text-embedding-3-small)
+- [x] pgvector cosine similarity search
+- [x] RAG pipeline end to end
+- [x] GPT-4o-mini chat completions
+- [x] Semantic vs keyword search
+- [x] Next.js App Router
+- [x] React hooks (useState, useEffect, useRef, useCallback)
+- [x] TypeScript interfaces
+- [x] Axios interceptors
+- [x] JWT storage in cookies
+- [x] File upload from browser
+- [x] Optimistic UI updates
+- [x] Vercel deployment
+- [x] CORS configuration
+- [x] Dynamic routes ([id] pattern)
+- [ ] Streaming AI responses
+- [ ] Document sharing
+- [ ] Multi-document conversations
+- [ ] User profile management
+
+---
+
+## Resume Bullets Earned
+- "Built and deployed RESTful API with FastAPI and PostgreSQL with 21+ endpoints"
+- "Implemented JWT authentication with bcrypt password hashing from scratch"
+- "Designed relational database schema with 5 tables and user-scoped access using SQLAlchemy ORM"
+- "Built file upload pipeline for PDF/TXT with text extraction and Supabase cloud storage"
+- "Implemented full-text keyword search using PostgreSQL ILIKE queries"
+- "Deployed production backend to Render with environment-based configuration"
+- "Built RAG pipeline using OpenAI embeddings, pgvector cosine similarity search, and GPT-4o-mini"
+- "Implemented semantic document search with 1536-dimension vector embeddings stored in PostgreSQL"
+- "Built full-stack AI document chat application with Next.js frontend and FastAPI backend"
+- "Deployed frontend to Vercel and backend to Render with environment-based configuration"
+- "Implemented JWT authentication flow with cookie storage and automatic token refresh"
+- "Built real-time chat UI with optimistic updates and typing indicators"
 
 ---
 
@@ -185,62 +281,16 @@
 | Difference between keyword and semantic search | Day 6 |
 | Why AI doesn't hallucinate with RAG | Day 6 |
 | pgvector <=> cosine distance operator | Day 6 |
-| task_type difference for doc vs query embeddings | Day 6 |
+| Next.js App Router vs Pages Router | Day 7 |
+| React component lifecycle with hooks | Day 7 |
+| Why axios interceptors over manual headers | Day 7 |
+| Optimistic UI updates | Day 7 |
+| CORS — why browsers block cross-origin | Day 7 |
+| Dynamic routes in Next.js | Day 7 |
+| Cookie vs localStorage for JWT | Day 7 |
+| Render free tier cold starts | Day 7 |
 
 ---
-
-## Skills Unlocked
-- [x] FastAPI server setup
-- [x] Pydantic models
-- [x] REST API design (CRUD)
-- [x] PostgreSQL + SQLAlchemy ORM
-- [x] Cloud database (Supabase)
-- [x] Environment variables (.env)
-- [x] JWT authentication from scratch
-- [x] bcrypt password hashing
-- [x] Dependency injection (Depends())
-- [x] API testing (Thunder Client + Swagger)
-- [x] File upload (PDF + TXT)
-- [x] Cloud file storage (Supabase Storage)
-- [x] PDF text extraction (PyPDF2)
-- [x] Database migrations (ALTER TABLE)
-- [x] Keyword search (PostgreSQL ILIKE)
-- [x] FastAPI route ordering rules
-- [x] Production deployment (Render)
-- [x] Environment variable management in production
-- [x] Relational data modeling (4 tables)
-- [x] Foreign key relationships + cascading delete
-- [x] Text chunking with overlap
-- [x] Vector embeddings (OpenAI text-embedding-3-small)
-- [x] pgvector cosine similarity search
-- [x] RAG pipeline end to end
-- [x] GPT-4o-mini chat completions
-- [x] Semantic vs keyword search
-- [ ] Next.js frontend
-- [ ] React components + hooks
-- [ ] Vercel deployment
-- [ ] Streaming AI responses
-
----
-
-## Resume Bullets Earned So Far
-- "Built and deployed RESTful API with FastAPI and PostgreSQL with 15+ endpoints"
-- "Implemented JWT authentication with bcrypt password hashing from scratch"
-- "Designed relational database schema with 4 tables and user-scoped access"
-- "Built file upload pipeline for PDF/TXT with text extraction and Supabase cloud storage"
-- "Implemented full-text keyword search using PostgreSQL ILIKE queries"
-- "Deployed production backend to Render with environment-based configuration"
-- "Built RAG pipeline using OpenAI embeddings, pgvector cosine similarity search, and GPT-4o-mini"
-- "Implemented semantic document search with 1536-dimension vector embeddings stored in PostgreSQL"
-
----
-
-## What's Next (Week 4)
-- [ ] Next.js frontend setup
-- [ ] Document upload UI
-- [ ] Conversation and chat UI
-- [ ] Connect frontend to live API
-- [ ] Deploy frontend to Vercel
 
 ## Notes to Future Self
 - Always recreate .env via terminal on Windows (hidden characters)
@@ -253,3 +303,7 @@
 - Gemini free tier has region restrictions — OpenAI works everywhere
 - Always check vector dimensions match between code and DB column
 - Use list_models() to find actual available models for any AI provider
+- Pydantic response models must include ALL fields you want returned
+- 401 interceptor must not redirect on the login page itself
+- Render deploys from GitHub — always push before expecting changes
+- Vercel auto-redeploys on every push to main branch

@@ -144,6 +144,7 @@ class DocumentResponse(BaseModel):
     title: str
     content: str
     tags: list[str]
+    is_processed: bool = False
     created_at: datetime
     updated_at: datetime
 

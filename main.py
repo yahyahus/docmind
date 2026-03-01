@@ -391,6 +391,23 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    # Delete chunks first (FK constraint)
+    db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == doc_id
+    ).delete()
+
+    # Delete linked conversations and their messages
+    convs = db.query(Conversation).filter(
+        Conversation.document_id == doc_id
+    ).all()
+    for conv in convs:
+        db.query(Message).filter(
+            Message.conversation_id == conv.id
+        ).delete()
+    db.query(Conversation).filter(
+        Conversation.document_id == doc_id
+    ).delete()
+
     db.delete(doc)
     db.commit()
     return {"message": "Document deleted successfully", "id": doc_id}

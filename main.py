@@ -733,6 +733,9 @@ async def process_document_endpoint(
 
         # Generate summary automatically
         summary = generate_summary(doc.content)
+
+        print(f"Generated summary: {summary[:100] if summary else 'NONE'}")
+        
         doc.summary = summary
         doc.is_processed = True
         db.commit()

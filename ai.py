@@ -3,9 +3,10 @@ FILE: ai.py
 ROLE: The AI layer. All OpenAI API calls and RAG logic live here.
 
 WHAT THIS FILE DOES:
-- Splits documents into overlapping chunks
+- Splits documents into overlapping chunks (semantic-aware)
 - Creates embeddings using OpenAI text-embedding-3-small (1536 dimensions)
 - Performs semantic search to find relevant chunks
+- Re-ranks retrieved chunks by relevance score before sending to GPT
 - Sends context + question + history to GPT-4o-mini
 - Returns AI response grounded in document content
 
@@ -14,6 +15,7 @@ KEY CONCEPTS:
 - Cosine similarity: how similar two vectors are (1.0 = identical)
 - RAG: Retrieval Augmented Generation
 - Chunking: split docs into focused pieces for better embeddings
+- Re-ranking: score retrieved chunks against query, drop low-relevance ones
 """
 
 from openai import OpenAI
@@ -22,7 +24,9 @@ from sqlalchemy import text
 from database import DocumentChunk, Message
 from dotenv import load_dotenv
 import uuid
+import re
 import os
+import math
 
 load_dotenv()
 
@@ -33,26 +37,73 @@ CHAT_MODEL = "gpt-4o-mini"                   # fast and cheap
 
 
 # ─────────────────────────────────────────
-# CHUNKING
+# CHUNKING — SEMANTIC AWARE
+#
+# Old approach: split every 400 words, fixed overlap.
+# Problem: cuts mid-sentence, mid-paragraph, loses context.
+#
+# New approach:
+# 1. Split on paragraph boundaries first (double newline)
+# 2. If a paragraph is too long, split on sentence boundaries
+# 3. Group small paragraphs together up to chunk_size words
+# 4. Overlap by carrying the last `overlap` words of previous chunk
+#
+# Result: chunks respect natural document structure.
 # ─────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
-    words = text.split()
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into sentences using punctuation boundaries."""
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
+    return [s.strip() for s in sentences if s.strip()]
 
-    if len(words) <= chunk_size:
-        return [text]
 
+def chunk_text(content: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
+    """
+    Semantic-aware chunking:
+    1. Split on paragraphs first
+    2. Split long paragraphs on sentences
+    3. Group into chunks up to chunk_size words
+    4. Add sentence-level overlap between chunks
+    """
+    # Step 1 — Split into paragraphs
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if p.strip()]
+
+    if not paragraphs:
+        return [content]
+
+    # Step 2 — Break long paragraphs into sentences
+    units = []
+    for para in paragraphs:
+        word_count = len(para.split())
+        if word_count > chunk_size:
+            sentences = split_into_sentences(para)
+            units.extend(sentences)
+        else:
+            units.append(para)
+
+    # Step 3 — Group units into chunks up to chunk_size words
     chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start += chunk_size - overlap
-        if start >= len(words):
-            break
+    current_words = []
+    current_count = 0
 
-    return chunks
+    for unit in units:
+        unit_words = unit.split()
+        unit_count = len(unit_words)
+
+        if current_count + unit_count > chunk_size and current_words:
+            chunks.append(" ".join(current_words))
+            # Step 4 — Overlap: carry last `overlap` words into next chunk
+            overlap_words = current_words[-overlap:] if len(current_words) > overlap else current_words
+            current_words = overlap_words + unit_words
+            current_count = len(current_words)
+        else:
+            current_words.extend(unit_words)
+            current_count += unit_count
+
+    if current_words:
+        chunks.append(" ".join(current_words))
+
+    return chunks if chunks else [content]
 
 
 # ─────────────────────────────────────────
@@ -65,6 +116,21 @@ def get_embedding(text: str) -> list[float]:
         input=text.replace("\n", " ")
     )
     return response.data[0].embedding
+
+
+# ─────────────────────────────────────────
+# COSINE SIMILARITY
+# Used for re-ranking: measures how similar two vectors are.
+# Returns a float between -1 and 1 (higher = more similar).
+# ─────────────────────────────────────────
+
+def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    mag_a = math.sqrt(sum(a * a for a in vec_a))
+    mag_b = math.sqrt(sum(b * b for b in vec_b))
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
 
 
 # ─────────────────────────────────────────
@@ -103,8 +169,16 @@ def process_document(
 
 
 # ─────────────────────────────────────────
-# SEMANTIC SEARCH
-# Returns list of content strings (not ORM objects)
+# SEMANTIC SEARCH + RE-RANKING
+#
+# Step 1: fetch 2x candidates from pgvector
+# Step 2: re-score each with cosine similarity
+# Step 3: sort by score, filter below MIN_SCORE
+# Step 4: return top `limit` chunks
+#
+# Why re-rank? pgvector's <=> is approximate and fast
+# but not perfectly ordered. Re-ranking with exact
+# cosine similarity improves result quality.
 # ─────────────────────────────────────────
 
 def find_relevant_chunks(
@@ -116,8 +190,11 @@ def find_relevant_chunks(
 ) -> list[str]:
     question_embedding = get_embedding(question)
 
+    # Fetch more candidates than needed for re-ranking
+    fetch_limit = limit * 2
+
     results = db.execute(text("""
-        SELECT content
+        SELECT content, embedding
         FROM document_chunks
         WHERE user_id = :user_id
         AND document_id = :document_id
@@ -127,15 +204,64 @@ def find_relevant_chunks(
         "user_id": user_id,
         "document_id": document_id,
         "embedding": str(question_embedding),
-        "limit": limit
+        "limit": fetch_limit
     }).fetchall()
 
-    return [row[0] for row in results]
+    if not results:
+        return []
+
+    # Re-rank by exact cosine similarity
+    scored = []
+    for row in results:
+        content = row[0]
+        chunk_embedding_str = row[1]
+        try:
+            chunk_embedding = [float(x) for x in chunk_embedding_str.strip("[]").split(",")]
+            score = cosine_similarity(question_embedding, chunk_embedding)
+        except Exception:
+            score = 0.0
+        scored.append((content, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Filter out low relevance chunks
+    MIN_SCORE = 0.3
+    top_chunks = [content for content, score in scored[:limit] if score >= MIN_SCORE]
+
+    # Fallback: if filtering removed everything, return top results unfiltered
+    if not top_chunks:
+        top_chunks = [content for content, _ in scored[:limit]]
+
+    return top_chunks
+
+
+# ─────────────────────────────────────────
+# MULTI-DOC SEARCH
+# ─────────────────────────────────────────
+
+def find_relevant_chunks_multi(
+    question: str,
+    user_id: str,
+    document_ids: list[str],
+    db: Session,
+    limit_per_doc: int = 3
+) -> list[str]:
+    """Find relevant chunks across multiple documents."""
+    all_chunks = []
+    for document_id in document_ids:
+        chunks = find_relevant_chunks(
+            question=question,
+            user_id=user_id,
+            document_id=document_id,
+            db=db,
+            limit=limit_per_doc
+        )
+        all_chunks.extend(chunks)
+    return all_chunks
 
 
 # ─────────────────────────────────────────
 # CONVERSATION HISTORY HELPER
-# Used by both regular and streaming chat endpoints
 # ─────────────────────────────────────────
 
 def get_conversation_history(conversation_id: str, db: Session) -> list:
@@ -235,23 +361,3 @@ Summary:"""
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
-
-def find_relevant_chunks_multi(
-    question: str,
-    user_id: str,
-    document_ids: list[str],
-    db: Session,
-    limit_per_doc: int = 3
-) -> list[str]:
-    """Find relevant chunks across multiple documents."""
-    all_chunks = []
-    for document_id in document_ids:
-        chunks = find_relevant_chunks(
-            question=question,
-            user_id=user_id,
-            document_id=document_id,
-            db=db,
-            limit=limit_per_doc
-        )
-        all_chunks.extend(chunks)
-    return all_chunks

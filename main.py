@@ -286,7 +286,7 @@ async def create_document(
 
 @app.get("/documents", response_model=list[DocumentResponse])
 async def list_documents(
-    limit: int = 10,
+    limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -575,7 +575,7 @@ async def create_conversation(
 
 @app.get("/conversations", response_model=list[ConversationResponse])
 async def list_conversations(
-    limit: int = 10,
+    limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)

@@ -65,6 +65,7 @@ class Document(Base):
     file_path = Column(String, nullable=True)
     file_type = Column(String, nullable=True)
     is_processed = Column(Boolean, default=False)
+    summary = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 

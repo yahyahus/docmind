@@ -871,7 +871,7 @@ async def chat_stream(
         user_id=current_user.id,
         db=db
     )
-    context = "\n\n".join([c.content for c in chunks])
+    context = "\n\n---\n\n".join(chunks)
     history = get_conversation_history(conv_id, db)
 
     # Build messages for OpenAI

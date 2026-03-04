@@ -111,6 +111,10 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
@@ -236,6 +240,47 @@ async def login(
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+@app.post("/auth/change-password")
+async def change_password(
+    data: PasswordChange,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not verify_password(data.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    if len(data.new_password) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 characters or less")
+
+    current_user.hashed_password = hash_password(data.new_password)
+    db.commit()
+    return {"message": "Password changed successfully"}
+
+@app.get("/auth/stats")
+async def get_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc_count = db.query(Document).filter(Document.user_id == current_user.id).count()
+    processed_count = db.query(Document).filter(
+        Document.user_id == current_user.id,
+        Document.is_processed == True
+    ).count()
+    conv_count = db.query(Conversation).filter(Conversation.user_id == current_user.id).count()
+    msg_count = db.query(Message).join(Conversation).filter(
+        Conversation.user_id == current_user.id
+    ).count()
+    chunk_count = db.query(DocumentChunk).filter(DocumentChunk.user_id == current_user.id).count()
+
+    return {
+        "documents": doc_count,
+        "processed_documents": processed_count,
+        "conversations": conv_count,
+        "messages": msg_count,
+        "chunks_indexed": chunk_count,
+        "member_since": current_user.created_at,
+    }
 
 # ─────────────────────────────────────────
 # DOCUMENT ENDPOINTS

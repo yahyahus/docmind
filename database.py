@@ -98,6 +98,7 @@ class Conversation(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     document_id = Column(String, ForeignKey("documents.id"), nullable=True)
+    document_ids = Column(ARRAY(String), default=[])
     title = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)

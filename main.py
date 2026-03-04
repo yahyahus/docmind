@@ -18,16 +18,10 @@ IMPORTS FROM:
 - database.py → Document, User, get_db
 - auth.py → hash_password, verify_password, create_access_token,
              create_refresh_token, get_current_user
-
-HOW TO READ THIS FILE:
-1. Start at the Pydantic models — they show the shape of data in/out
-2. Then read each endpoint — the function name tells you what it does
-3. The Depends() calls tell you what each endpoint needs to run
 """
 
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.openapi.models import SecurityScheme
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -43,7 +37,11 @@ import io
 import json
 import PyPDF2
 
-from ai import process_document, generate_rag_response, generate_summary, client
+from ai import (
+    process_document, generate_rag_response, generate_summary,
+    client, find_relevant_chunks, find_relevant_chunks_multi,
+    get_conversation_history, build_messages
+)
 from database import Document, User, Conversation, Message, DocumentChunk, get_db
 from auth import (
     hash_password, verify_password,
@@ -59,23 +57,14 @@ load_dotenv()
 
 app = FastAPI(title="DocMind API", version="1.0.0")
 
-# ─────────────────────────────────────────
-# CORS MIDDLEWARE
-# Allows the frontend (different domain) to call this API.
-# Without this, browsers block all cross-origin requests.
-# origins = list of domains allowed to make requests.
-# In production, replace "*" with your actual Vercel URL.
-# ─────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # allow all origins for now
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],        # allow all HTTP methods
-    allow_headers=["*"],        # allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Supabase client for file storage
-# We use this to upload files to Supabase Storage buckets
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
@@ -90,7 +79,6 @@ def custom_openapi():
         version="1.0.0",
         routes=app.routes,
     )
-    # Add Bearer auth scheme
     openapi_schema["components"]["securitySchemes"] = {
         "BearerAuth": {
             "type": "http",
@@ -98,7 +86,6 @@ def custom_openapi():
             "bearerFormat": "JWT",
         }
     }
-    # Apply to all endpoints
     for path in openapi_schema["paths"].values():
         for operation in path.values():
             operation["security"] = [{"BearerAuth": []}]
@@ -148,25 +135,23 @@ class DocumentResponse(BaseModel):
     file_path: Optional[str] = None
     file_type: Optional[str] = None
     is_processed: bool = False
-    summary: Optional[str] = None  # add this
+    summary: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
 
-# ─────────────────────────────────────────
-# CONVERSATION PYDANTIC MODELS
-# ─────────────────────────────────────────
-
 class ConversationCreate(BaseModel):
     title: str
-    document_id: Optional[str] = None  # optional — can chat without a specific doc
+    document_id: Optional[str] = None
+    document_ids: Optional[list[str]] = []
 
 class ConversationResponse(BaseModel):
     id: str
     user_id: str
     document_id: Optional[str] = None
+    document_ids: list[str] = []
     title: str
     created_at: datetime
     updated_at: datetime
@@ -174,26 +159,22 @@ class ConversationResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
-# ─────────────────────────────────────────
-# MESSAGE PYDANTIC MODELS
-# ─────────────────────────────────────────
-
 class MessageCreate(BaseModel):
-    content: str  # only content needed — role is always "user" when human sends
+    content: str
 
 class MessageResponse(BaseModel):
     id: str
     conversation_id: str
-    role: str       # "user" or "assistant"
+    role: str
     content: str
     created_at: datetime
 
     class Config:
         from_attributes = True
 
+
 # ─────────────────────────────────────────
-# AUTH ENDPOINTS
+# ROOT + HEALTH
 # ─────────────────────────────────────────
 
 @app.get("/")
@@ -212,18 +193,19 @@ async def health_check(db: Session = Depends(get_db)):
         "user_count": user_count
     }
 
+
+# ─────────────────────────────────────────
+# AUTH ENDPOINTS
+# ─────────────────────────────────────────
+
 @app.post("/auth/register", response_model=UserResponse, status_code=201)
 async def register(user_data: UserRegister, db: Session = Depends(get_db)):
     if len(user_data.password) > 72:
         raise HTTPException(status_code=400, detail="Password must be 72 characters or less")
 
-    # Check if email already exists
     existing = db.query(User).filter(User.email == user_data.email).first()
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered"
-        )
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     user = User(
         id=str(uuid.uuid4()),
@@ -240,15 +222,9 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    # Find user by email
     user = db.query(User).filter(User.email == form_data.username).first()
-
-    # Verify user exists and password is correct
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password"
-        )
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
     return TokenResponse(
         access_token=create_access_token(user.id),
@@ -258,24 +234,22 @@ async def login(
 
 @app.get("/auth/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
-    # get_current_user already did all the work
-    # if we reach here, the token is valid and user exists
     return current_user
 
 
 # ─────────────────────────────────────────
-# DOCUMENT ENDPOINTS (now protected + user-scoped)
+# DOCUMENT ENDPOINTS
 # ─────────────────────────────────────────
 
 @app.post("/documents", response_model=DocumentResponse, status_code=201)
 async def create_document(
     doc: DocumentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # 👈 protected
+    current_user: User = Depends(get_current_user)
 ):
     db_doc = Document(
         id=str(uuid.uuid4()),
-        user_id=current_user.id,   # document belongs to logged-in user
+        user_id=current_user.id,
         title=doc.title,
         content=doc.content,
         tags=doc.tags
@@ -292,49 +266,31 @@ async def list_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Only returns THIS user's documents
     return db.query(Document).filter(
         Document.user_id == current_user.id
     ).offset(offset).limit(limit).all()
 
-# ─────────────────────────────────────────
-# SEARCH ENDPOINT
-# Searches across title, content, and tags
-# Uses PostgreSQL ILIKE = case-insensitive pattern matching
-# Example: searching "python" finds "Python", "PYTHON", "python3"
-# ─────────────────────────────────────────
-
 @app.get("/documents/search", response_model=list[DocumentResponse])
 async def search_documents(
-    q: str,                          # the search query e.g. ?q=python
+    q: str,
     limit: int = 10,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Search across the current user's documents.
-    Searches title, content, and tags simultaneously.
-    Returns documents ranked by most recently updated.
-    """
     if not q or len(q.strip()) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Search query cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
 
-    search_term = f"%{q.strip()}%"  # % is wildcard in SQL LIKE queries
-
+    search_term = f"%{q.strip()}%"
     results = db.query(Document).filter(
-        Document.user_id == current_user.id,  # only search THIS user's docs
-        # Search across title OR content OR tags
+        Document.user_id == current_user.id,
         (
             Document.title.ilike(search_term) |
             Document.content.ilike(search_term) |
-            Document.tags.any(q.strip().lower())  # search inside tags array
+            Document.tags.any(q.strip().lower())
         )
     ).order_by(
-        Document.updated_at.desc()   # most recently updated first
+        Document.updated_at.desc()
     ).offset(offset).limit(limit).all()
 
     return results
@@ -347,7 +303,7 @@ async def get_document(
 ):
     doc = db.query(Document).filter(
         Document.id == doc_id,
-        Document.user_id == current_user.id  # can't access other users' docs
+        Document.user_id == current_user.id
     ).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -413,16 +369,12 @@ async def delete_document(
     db.commit()
     return {"message": "Document deleted successfully", "id": doc_id}
 
+
 # ─────────────────────────────────────────
 # FILE UPLOAD HELPERS
 # ─────────────────────────────────────────
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """
-    Reads raw PDF bytes and extracts all text from every page.
-    PyPDF2 reads the PDF structure and pulls out readable text.
-    Some scanned PDFs return empty text — that's a known limitation.
-    """
     pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text = ""
     for page in pdf_reader.pages:
@@ -431,12 +383,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
             text += page_text + "\n"
     return text.strip()
 
-
 def upload_to_supabase(file_bytes: bytes, file_path: str, content_type: str) -> str:
-    """
-    Uploads a file to Supabase Storage bucket called 'documents'.
-    Returns the file path so we can store it in the database.
-    """
     supabase.storage.from_("documents").upload(
         path=file_path,
         file=file_bytes,
@@ -455,65 +402,32 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Accepts a PDF or TXT file upload.
-    Flow:
-    1. Validate file type
-    2. Read file bytes
-    3. Extract text content
-    4. Upload file to Supabase Storage
-    5. Save metadata + content to PostgreSQL
-    6. Return the created document
-    """
-
-    # Step 1 — Validate file type
     allowed_types = ["application/pdf", "text/plain"]
     if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type not allowed. Upload PDF or TXT files only."
-        )
+        raise HTTPException(status_code=400, detail="File type not allowed. Upload PDF or TXT files only.")
 
-    # Step 2 — Read file bytes into memory
     file_bytes = await file.read()
 
-    # Enforce file size limit (5MB)
-    max_size = 5 * 1024 * 1024  # 5MB in bytes
+    max_size = 5 * 1024 * 1024
     if len(file_bytes) > max_size:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Maximum size is 5MB."
-        )
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
 
-    # Step 3 — Extract text based on file type
     if file.content_type == "application/pdf":
         content = extract_text_from_pdf(file_bytes)
         file_type = "pdf"
         if not content:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not extract text from PDF. File may be scanned or image-based."
-            )
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
     else:
-        # TXT file — just decode the bytes to string
         content = file_bytes.decode("utf-8")
         file_type = "txt"
 
-    # Step 4 — Upload to Supabase Storage
-    # Path format: user_id/unique_id_filename
-    # This keeps each user's files in their own folder
-    file_extension = "pdf" if file_type == "pdf" else "txt"
     storage_path = f"{current_user.id}/{uuid.uuid4()}/{file.filename}"
 
     try:
         upload_to_supabase(file_bytes, storage_path, file.content_type)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"File storage failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"File storage failed: {str(e)}")
 
-    # Step 5 — Storage succeeded, now save to PostgreSQL
     try:
         db_doc = Document(
             id=str(uuid.uuid4()),
@@ -530,11 +444,9 @@ async def upload_document(
         return db_doc
     except Exception as e:
         print(f"DATABASE ERROR: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database save failed: {str(e)}"
-        )
-    
+        raise HTTPException(status_code=500, detail=f"Database save failed: {str(e)}")
+
+
 # ─────────────────────────────────────────
 # CONVERSATION ENDPOINTS
 # ─────────────────────────────────────────
@@ -545,34 +457,33 @@ async def create_conversation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Creates a new conversation for the logged-in user.
-    Optionally links to a specific document via document_id.
-    If document_id provided, verify it belongs to this user.
-    """
-    # If document_id provided, verify it belongs to this user
-    if conv.document_id:
+    # Normalize — if document_id provided, include it in document_ids too
+    doc_ids = list(conv.document_ids or [])
+    if conv.document_id and conv.document_id not in doc_ids:
+        doc_ids = [conv.document_id] + doc_ids
+
+    # Verify all documents belong to this user and are processed
+    for did in doc_ids:
         doc = db.query(Document).filter(
-            Document.id == conv.document_id,
+            Document.id == did,
             Document.user_id == current_user.id
         ).first()
         if not doc:
-            raise HTTPException(
-                status_code=404,
-                detail="Document not found or does not belong to you"
-            )
+            raise HTTPException(status_code=404, detail=f"Document {did} not found")
+        if not doc.is_processed:
+            raise HTTPException(status_code=400, detail=f"Document '{doc.title}' is not processed yet")
 
     db_conv = Conversation(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        document_id=conv.document_id,
+        document_id=doc_ids[0] if doc_ids else None,
+        document_ids=doc_ids,
         title=conv.title
     )
     db.add(db_conv)
     db.commit()
     db.refresh(db_conv)
     return db_conv
-
 
 @app.get("/conversations", response_model=list[ConversationResponse])
 async def list_conversations(
@@ -581,13 +492,11 @@ async def list_conversations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Returns all conversations belonging to the logged-in user."""
     return db.query(Conversation).filter(
         Conversation.user_id == current_user.id
     ).order_by(
         Conversation.updated_at.desc()
     ).offset(offset).limit(limit).all()
-
 
 @app.get("/conversations/{conv_id}", response_model=ConversationResponse)
 async def get_conversation(
@@ -595,7 +504,6 @@ async def get_conversation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Returns a single conversation by ID."""
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -604,18 +512,12 @@ async def get_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv
 
-
 @app.delete("/conversations/{conv_id}")
 async def delete_conversation(
     conv_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Deletes a conversation and ALL its messages.
-    Messages are deleted first because of foreign key constraint —
-    you can't delete a conversation that still has messages pointing to it.
-    """
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -623,11 +525,7 @@ async def delete_conversation(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Delete all messages in this conversation first
-    db.query(Message).filter(
-        Message.conversation_id == conv_id
-    ).delete()
-
+    db.query(Message).filter(Message.conversation_id == conv_id).delete()
     db.delete(conv)
     db.commit()
     return {"message": "Conversation and all messages deleted", "id": conv_id}
@@ -637,22 +535,13 @@ async def delete_conversation(
 # MESSAGE ENDPOINTS
 # ─────────────────────────────────────────
 
-@app.post("/conversations/{conv_id}/messages",
-          response_model=MessageResponse,
-          status_code=201)
+@app.post("/conversations/{conv_id}/messages", response_model=MessageResponse, status_code=201)
 async def add_message(
     conv_id: str,
     message: MessageCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Adds a user message to a conversation.
-    Role is always "user" here — AI responses come in Week 3.
-    In Week 3 this endpoint will also generate and save
-    an "assistant" message automatically.
-    """
-    # Verify conversation exists and belongs to this user
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -660,36 +549,24 @@ async def add_message(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Save the user message
     db_message = Message(
         id=str(uuid.uuid4()),
         conversation_id=conv_id,
-        role="user",         # always "user" when human sends a message
+        role="user",
         content=message.content
     )
     db.add(db_message)
-
-    # Update conversation updated_at so it appears at top of list
     conv.updated_at = datetime.utcnow()
-
     db.commit()
     db.refresh(db_message)
     return db_message
 
-
-@app.get("/conversations/{conv_id}/messages",
-         response_model=list[MessageResponse])
+@app.get("/conversations/{conv_id}/messages", response_model=list[MessageResponse])
 async def get_messages(
     conv_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Returns all messages in a conversation in chronological order.
-    This is the full chat history — oldest first.
-    In Week 3, this history gets sent to OpenAI as context.
-    """
-    # Verify conversation belongs to this user
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -699,9 +576,8 @@ async def get_messages(
 
     return db.query(Message).filter(
         Message.conversation_id == conv_id
-    ).order_by(
-        Message.created_at.asc()   # oldest first = chronological order
-    ).all()
+    ).order_by(Message.created_at.asc()).all()
+
 
 # ─────────────────────────────────────────
 # AI ENDPOINTS
@@ -720,7 +596,6 @@ async def process_document_endpoint(
 
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-
     if not doc.content:
         raise HTTPException(status_code=400, detail="Document has no content to process")
 
@@ -732,11 +607,9 @@ async def process_document_endpoint(
             db=db
         )
 
-        # Generate summary automatically
         summary = generate_summary(doc.content)
-
         print(f"Generated summary: {summary[:100] if summary else 'NONE'}")
-        
+
         doc.summary = summary
         doc.is_processed = True
         db.commit()
@@ -759,13 +632,6 @@ async def chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Main AI chat endpoint — full RAG pipeline.
-    1. Saves user message
-    2. Finds relevant document chunks
-    3. Sends context + history + question to Gemini
-    4. Saves and returns AI response
-    """
     import uuid as uuid_lib
 
     conv = db.query(Conversation).filter(
@@ -775,21 +641,15 @@ async def chat(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if not conv.document_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Conversation must be linked to a document. Include document_id when creating the conversation."
-        )
+    # Support both single and multi-doc conversations
+    doc_ids = conv.document_ids if conv.document_ids else ([conv.document_id] if conv.document_id else [])
+    if not doc_ids:
+        raise HTTPException(status_code=400, detail="Conversation has no linked documents.")
 
-    doc = db.query(Document).filter(
-        Document.id == conv.document_id
-    ).first()
-
-    if not doc.is_processed:
-        raise HTTPException(
-            status_code=400,
-            detail="Document not processed yet. Call POST /documents/{id}/process first."
-        )
+    for did in doc_ids:
+        d = db.query(Document).filter(Document.id == did).first()
+        if not d or not d.is_processed:
+            raise HTTPException(status_code=400, detail="Document not processed yet.")
 
     # Save user message
     user_message = Message(
@@ -801,20 +661,36 @@ async def chat(
     db.add(user_message)
     db.commit()
 
-    # Generate AI response
+    # Generate AI response — single or multi doc
     try:
-        ai_response = generate_rag_response(
-            question=message.content,
-            document_id=conv.document_id,
-            user_id=current_user.id,
-            conversation_id=conv_id,
-            db=db
-        )
+        if len(doc_ids) == 1:
+            ai_response = generate_rag_response(
+                question=message.content,
+                document_id=doc_ids[0],
+                user_id=current_user.id,
+                conversation_id=conv_id,
+                db=db
+            )
+        else:
+            chunks = find_relevant_chunks_multi(
+                question=message.content,
+                user_id=current_user.id,
+                document_ids=doc_ids,
+                db=db
+            )
+            context = "\n\n---\n\n".join(chunks) if chunks else "No relevant context found."
+            history = get_conversation_history(conv_id, db)
+            messages_for_ai = build_messages(context, history, message.content)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages_for_ai,
+                max_tokens=1000,
+                temperature=0.3
+            )
+            ai_response = response.choices[0].message.content
+
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI response failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
 
     # Save assistant message
     assistant_message = Message(
@@ -827,8 +703,8 @@ async def chat(
     conv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(assistant_message)
-
     return assistant_message
+
 
 @app.post("/conversations/{conv_id}/chat/stream")
 async def chat_stream(
@@ -846,14 +722,17 @@ async def chat_stream(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if not conv.document_id:
-        raise HTTPException(status_code=400, detail="Conversation must be linked to a document.")
+    # Support both single and multi-doc conversations
+    doc_ids = conv.document_ids if conv.document_ids else ([conv.document_id] if conv.document_id else [])
+    if not doc_ids:
+        raise HTTPException(status_code=400, detail="Conversation has no linked documents.")
 
-    doc = db.query(Document).filter(Document.id == conv.document_id).first()
-    if not doc.is_processed:
-        raise HTTPException(status_code=400, detail="Document not processed yet.")
+    for did in doc_ids:
+        d = db.query(Document).filter(Document.id == did).first()
+        if not d or not d.is_processed:
+            raise HTTPException(status_code=400, detail="Document not processed yet.")
 
-    # Save user message first
+    # Save user message
     user_message = Message(
         id=str(uuid_lib.uuid4()),
         conversation_id=conv_id,
@@ -863,38 +742,34 @@ async def chat_stream(
     db.add(user_message)
     db.commit()
 
-    # Get relevant chunks
-    from ai import find_relevant_chunks, get_conversation_history
-    chunks = find_relevant_chunks(
-        question=message.content,
-        document_id=conv.document_id,
-        user_id=current_user.id,
-        db=db
-    )
-    context = "\n\n---\n\n".join(chunks)
+    # Get relevant chunks — single or multi doc
+    if len(doc_ids) == 1:
+        chunks = find_relevant_chunks(
+            question=message.content,
+            document_id=doc_ids[0],
+            user_id=current_user.id,
+            db=db
+        )
+    else:
+        chunks = find_relevant_chunks_multi(
+            question=message.content,
+            user_id=current_user.id,
+            document_ids=doc_ids,
+            db=db
+        )
+
+    context = "\n\n---\n\n".join(chunks) if chunks else "No relevant context found."
     history = get_conversation_history(conv_id, db)
-
-    # Build messages for OpenAI
-    system_prompt = f"""You are a helpful AI assistant that answers questions about documents.
-Answer ONLY based on the context provided below. If the answer is not in the context, say "I don't have enough information in this document to answer that."
-
-Document context:
-{context}"""
-
-    messages_for_ai = [{"role": "system", "content": system_prompt}]
-    for msg in history[-10:]:
-        messages_for_ai.append({"role": msg.role, "content": msg.content})
-    messages_for_ai.append({"role": "user", "content": message.content})
-
+    messages_for_ai = build_messages(context, history, message.content)
     assistant_id = str(uuid_lib.uuid4())
 
     async def generate():
         full_response = ""
         try:
-            from ai import client
             stream = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages_for_ai,
+                max_tokens=1000,
                 temperature=0.3,
                 stream=True,
             )
@@ -904,7 +779,7 @@ Document context:
                     full_response += delta
                     yield f"data: {json.dumps({'content': delta})}\n\n"
 
-            # Save complete response to DB after streaming finishes
+            # Save complete response after streaming finishes
             assistant_message = Message(
                 id=assistant_id,
                 conversation_id=conv_id,
@@ -914,7 +789,6 @@ Document context:
             db.add(assistant_message)
             conv.updated_at = datetime.utcnow()
             db.commit()
-
             yield f"data: {json.dumps({'done': True, 'id': assistant_id})}\n\n"
 
         except Exception as e:
@@ -923,11 +797,9 @@ Document context:
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
+
 
 @app.get("/documents/{doc_id}/chunks")
 async def get_document_chunks(
@@ -935,10 +807,6 @@ async def get_document_chunks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Returns all chunks for a document.
-    Useful for debugging — see exactly how your document was split.
-    """
     doc = db.query(Document).filter(
         Document.id == doc_id,
         Document.user_id == current_user.id

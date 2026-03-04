@@ -235,3 +235,23 @@ Summary:"""
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
+
+def find_relevant_chunks_multi(
+    question: str,
+    user_id: str,
+    document_ids: list[str],
+    db: Session,
+    limit_per_doc: int = 3
+) -> list[str]:
+    """Find relevant chunks across multiple documents."""
+    all_chunks = []
+    for document_id in document_ids:
+        chunks = find_relevant_chunks(
+            question=question,
+            user_id=user_id,
+            document_id=document_id,
+            db=db,
+            limit=limit_per_doc
+        )
+        all_chunks.extend(chunks)
+    return all_chunks

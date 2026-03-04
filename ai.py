@@ -4,7 +4,7 @@ ROLE: The AI layer. All OpenAI API calls and RAG logic live here.
 
 WHAT THIS FILE DOES:
 - Splits documents into overlapping chunks
-- Creates embeddings using OpenAI text-embedding-ada-002 (1536 dimensions)
+- Creates embeddings using OpenAI text-embedding-3-small (1536 dimensions)
 - Performs semantic search to find relevant chunks
 - Sends context + question + history to GPT-4o-mini
 - Returns AI response grounded in document content
@@ -57,8 +57,6 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]
 
 # ─────────────────────────────────────────
 # EMBEDDING
-# OpenAI ada-002 produces 1536-dimensional vectors.
-# Same model used for both documents and queries.
 # ─────────────────────────────────────────
 
 def get_embedding(text: str) -> list[float]:
@@ -106,6 +104,7 @@ def process_document(
 
 # ─────────────────────────────────────────
 # SEMANTIC SEARCH
+# Returns list of content strings (not ORM objects)
 # ─────────────────────────────────────────
 
 def find_relevant_chunks(
@@ -135,37 +134,25 @@ def find_relevant_chunks(
 
 
 # ─────────────────────────────────────────
-# GENERATE RAG RESPONSE
+# CONVERSATION HISTORY HELPER
+# Used by both regular and streaming chat endpoints
 # ─────────────────────────────────────────
 
-def generate_rag_response(
-    question: str,
-    document_id: str,
-    user_id: str,
-    conversation_id: str,
-    db: Session
-) -> str:
-    # Step 1 — Retrieve relevant chunks
-    relevant_chunks = find_relevant_chunks(
-        question=question,
-        user_id=user_id,
-        document_id=document_id,
-        db=db
-    )
-
-    if not relevant_chunks:
-        return "I couldn't find relevant information in this document to answer your question."
-
-    context = "\n\n---\n\n".join(relevant_chunks)
-
-    # Step 2 — Get conversation history
-    history = db.query(Message).filter(
+def get_conversation_history(conversation_id: str, db: Session) -> list:
+    """Returns last 10 messages in chronological order."""
+    return db.query(Message).filter(
         Message.conversation_id == conversation_id
     ).order_by(
         Message.created_at.asc()
     ).limit(10).all()
 
-    # Step 3 — Build messages array for OpenAI
+
+# ─────────────────────────────────────────
+# BUILD MESSAGES HELPER
+# Shared prompt structure for regular + streaming
+# ─────────────────────────────────────────
+
+def build_messages(context: str, history: list, question: str) -> list:
     messages = [
         {
             "role": "system",
@@ -183,21 +170,37 @@ DOCUMENT CONTEXT:
 {context}"""
         }
     ]
-
-    # Add conversation history
     for msg in history:
-        messages.append({
-            "role": msg.role,
-            "content": msg.content
-        })
+        messages.append({"role": msg.role, "content": msg.content})
+    messages.append({"role": "user", "content": question})
+    return messages
 
-    # Add current question
-    messages.append({
-        "role": "user",
-        "content": question
-    })
 
-    # Step 4 — Call OpenAI
+# ─────────────────────────────────────────
+# GENERATE RAG RESPONSE (non-streaming)
+# ─────────────────────────────────────────
+
+def generate_rag_response(
+    question: str,
+    document_id: str,
+    user_id: str,
+    conversation_id: str,
+    db: Session
+) -> str:
+    relevant_chunks = find_relevant_chunks(
+        question=question,
+        user_id=user_id,
+        document_id=document_id,
+        db=db
+    )
+
+    if not relevant_chunks:
+        return "I couldn't find relevant information in this document to answer your question."
+
+    context = "\n\n---\n\n".join(relevant_chunks)
+    history = get_conversation_history(conversation_id, db)
+    messages = build_messages(context, history, question)
+
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
@@ -206,6 +209,11 @@ DOCUMENT CONTEXT:
     )
 
     return response.choices[0].message.content
+
+
+# ─────────────────────────────────────────
+# GENERATE SUMMARY
+# ─────────────────────────────────────────
 
 def generate_summary(content: str) -> str:
     """

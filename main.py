@@ -30,6 +30,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.openapi.models import SecurityScheme
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -39,10 +40,10 @@ from dotenv import load_dotenv
 import uuid
 import os
 import io
-
+import json
 import PyPDF2
 
-from ai import process_document, generate_rag_response, generate_summary
+from ai import process_document, generate_rag_response, generate_summary, client
 from database import Document, User, Conversation, Message, DocumentChunk, get_db
 from auth import (
     hash_password, verify_password,
@@ -829,6 +830,104 @@ async def chat(
 
     return assistant_message
 
+@app.post("/conversations/{conv_id}/chat/stream")
+async def chat_stream(
+    conv_id: str,
+    message: MessageCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    import uuid as uuid_lib
+
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conv.document_id:
+        raise HTTPException(status_code=400, detail="Conversation must be linked to a document.")
+
+    doc = db.query(Document).filter(Document.id == conv.document_id).first()
+    if not doc.is_processed:
+        raise HTTPException(status_code=400, detail="Document not processed yet.")
+
+    # Save user message first
+    user_message = Message(
+        id=str(uuid_lib.uuid4()),
+        conversation_id=conv_id,
+        role="user",
+        content=message.content
+    )
+    db.add(user_message)
+    db.commit()
+
+    # Get relevant chunks
+    from ai import find_relevant_chunks, get_conversation_history
+    chunks = find_relevant_chunks(
+        question=message.content,
+        document_id=conv.document_id,
+        user_id=current_user.id,
+        db=db
+    )
+    context = "\n\n".join([c.content for c in chunks])
+    history = get_conversation_history(conv_id, db)
+
+    # Build messages for OpenAI
+    system_prompt = f"""You are a helpful AI assistant that answers questions about documents.
+Answer ONLY based on the context provided below. If the answer is not in the context, say "I don't have enough information in this document to answer that."
+
+Document context:
+{context}"""
+
+    messages_for_ai = [{"role": "system", "content": system_prompt}]
+    for msg in history[-10:]:
+        messages_for_ai.append({"role": msg.role, "content": msg.content})
+    messages_for_ai.append({"role": "user", "content": message.content})
+
+    assistant_id = str(uuid_lib.uuid4())
+
+    async def generate():
+        full_response = ""
+        try:
+            from ai import client
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages_for_ai,
+                temperature=0.3,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    full_response += delta
+                    yield f"data: {json.dumps({'content': delta})}\n\n"
+
+            # Save complete response to DB after streaming finishes
+            assistant_message = Message(
+                id=assistant_id,
+                conversation_id=conv_id,
+                role="assistant",
+                content=full_response
+            )
+            db.add(assistant_message)
+            conv.updated_at = datetime.utcnow()
+            db.commit()
+
+            yield f"data: {json.dumps({'done': True, 'id': assistant_id})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 @app.get("/documents/{doc_id}/chunks")
 async def get_document_chunks(

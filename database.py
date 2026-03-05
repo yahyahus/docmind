@@ -113,7 +113,16 @@ class Message(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
 
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    token = Column(String, unique=True)
+    expires_at = Column(DateTime)
+    used = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
 def get_db():
     db = SessionLocal()
     try:

@@ -42,7 +42,7 @@ from ai import (
     client, find_relevant_chunks, find_relevant_chunks_multi,
     get_conversation_history, build_messages
 )
-from database import Document, User, Conversation, Message, DocumentChunk, get_db
+from database import Document, User, Conversation, Message, DocumentChunk, PasswordResetToken, get_db
 from auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
@@ -176,6 +176,12 @@ class MessageResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 # ─────────────────────────────────────────
 # ROOT + HEALTH
@@ -256,6 +262,108 @@ async def change_password(
     current_user.hashed_password = hash_password(data.new_password)
     db.commit()
     return {"message": "Password changed successfully"}
+
+@app.post("/auth/forgot-password")
+async def forgot_password(
+    data: ForgotPasswordRequest,
+    db: Session = Depends(get_db)
+):
+    import resend
+    import secrets
+    from datetime import timedelta
+
+    resend.api_key = os.getenv("RESEND_API_KEY")
+
+    # Always return success even if email not found (security best practice)
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user:
+        return {"message": "If that email exists, a reset link has been sent"}
+
+    # Invalidate any existing unused tokens for this user
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.used == False
+    ).delete()
+
+    # Generate a secure token
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=1)
+
+    reset_token = PasswordResetToken(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        token=token,
+        expires_at=expires_at
+    )
+    db.add(reset_token)
+    db.commit()
+
+    # Send email via Resend
+    frontend_url = os.getenv("FRONTEND_URL", "https://docmind-frontend-eight.vercel.app")
+    reset_link = f"{frontend_url}/reset-password?token={token}"
+
+    try:
+        resend.Emails.send({
+            "from": "DocMind <onboarding@resend.dev>",
+            "to": user.email,
+            "subject": "Reset your DocMind password",
+            "html": f"""
+                <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+                    <h2 style="font-size: 20px; color: #111;">Reset your password</h2>
+                    <p style="color: #555; line-height: 1.6;">
+                        We received a request to reset your DocMind password.
+                        Click the button below to choose a new one.
+                        This link expires in 1 hour.
+                    </p>
+                    <a href="{reset_link}"
+                        style="display: inline-block; margin: 24px 0; padding: 12px 24px;
+                        background: #6366F1; color: white; border-radius: 8px;
+                        text-decoration: none; font-weight: 600;">
+                        Reset Password →
+                    </a>
+                    <p style="color: #999; font-size: 13px;">
+                        If you didn't request this, you can safely ignore this email.
+                    </p>
+                </div>
+            """
+        })
+    except Exception as e:
+        print(f"Email send failed: {str(e)}")
+        # Still return success — don't expose email errors to client
+
+    return {"message": "If that email exists, a reset link has been sent"}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(
+    data: ResetPasswordRequest,
+    db: Session = Depends(get_db)
+):
+    reset_token = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token == data.token,
+        PasswordResetToken.used == False
+    ).first()
+
+    if not reset_token:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    if reset_token.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if len(data.new_password) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 characters or less")
+
+    # Update password
+    user = db.query(User).filter(User.id == reset_token.user_id).first()
+    user.hashed_password = hash_password(data.new_password)
+
+    # Mark token as used
+    reset_token.used = True
+    db.commit()
+
+    return {"message": "Password reset successfully"}
 
 @app.get("/auth/stats")
 async def get_stats(

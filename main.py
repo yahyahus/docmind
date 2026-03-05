@@ -40,12 +40,13 @@ import resend
 import secrets
 from datetime import timedelta
 
+
 from ai import (
     process_document, generate_rag_response, generate_summary,
     client, find_relevant_chunks, find_relevant_chunks_multi,
     get_conversation_history, build_messages
 )
-from database import Document, User, Conversation, Message, DocumentChunk, PasswordResetToken, get_db
+from database import Document, User, Conversation, Message, DocumentChunk, PasswordResetToken, ShareLink, get_db
 from auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
@@ -185,6 +186,16 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+
+class ShareLinkResponse(BaseModel):
+    id: str
+    conversation_id: str
+    token: str
+    url: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 # ─────────────────────────────────────────
 # ROOT + HEALTH
@@ -761,6 +772,100 @@ async def export_conversation(
         "title": conv.title,
         "markdown": markdown,
         "message_count": len(messages)
+    }
+
+@app.post("/conversations/{conv_id}/share")
+async def create_share_link(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Return existing share link if one exists
+    existing = db.query(ShareLink).filter(
+        ShareLink.conversation_id == conv_id
+    ).first()
+    if existing:
+        frontend_url = os.getenv("FRONTEND_URL", "https://docmind-frontend-eight.vercel.app")
+        return {
+            "id": existing.id,
+            "conversation_id": conv_id,
+            "token": existing.token,
+            "url": f"{frontend_url}/share/{existing.token}",
+            "created_at": existing.created_at
+        }
+
+    token = secrets.token_urlsafe(24)
+    share = ShareLink(
+        id=str(uuid.uuid4()),
+        conversation_id=conv_id,
+        token=token
+    )
+    db.add(share)
+    db.commit()
+
+    frontend_url = os.getenv("FRONTEND_URL", "https://docmind-frontend-eight.vercel.app")
+    return {
+        "id": share.id,
+        "conversation_id": conv_id,
+        "token": token,
+        "url": f"{frontend_url}/share/{token}",
+        "created_at": share.created_at
+    }
+
+
+@app.delete("/conversations/{conv_id}/share")
+async def revoke_share_link(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    db.query(ShareLink).filter(
+        ShareLink.conversation_id == conv_id
+    ).delete()
+    db.commit()
+    return {"message": "Share link revoked"}
+
+
+@app.get("/share/{token}")
+async def get_shared_conversation(
+    token: str,
+    db: Session = Depends(get_db)
+):
+    share = db.query(ShareLink).filter(
+        ShareLink.token == token
+    ).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Share link not found or revoked")
+
+    conv = db.query(Conversation).filter(
+        Conversation.id == share.conversation_id
+    ).first()
+
+    messages = db.query(Message).filter(
+        Message.conversation_id == share.conversation_id
+    ).order_by(Message.created_at.asc()).all()
+
+    return {
+        "title": conv.title,
+        "created_at": conv.created_at,
+        "messages": [
+            {"role": m.role, "content": m.content, "created_at": m.created_at}
+            for m in messages
+        ]
     }
 
 # ─────────────────────────────────────────

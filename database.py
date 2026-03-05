@@ -122,6 +122,14 @@ class PasswordResetToken(Base):
     expires_at = Column(DateTime)
     used = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class ShareLink(Base):
+    __tablename__ = "share_links"
+
+    id = Column(String, primary_key=True)
+    conversation_id = Column(String, ForeignKey("conversations.id"))
+    token = Column(String, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
     
 def get_db():
     db = SessionLocal()

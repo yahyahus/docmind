@@ -36,6 +36,9 @@ import os
 import io
 import json
 import PyPDF2
+import resend
+import secrets
+from datetime import timedelta
 
 from ai import (
     process_document, generate_rag_response, generate_summary,
@@ -268,24 +271,17 @@ async def forgot_password(
     data: ForgotPasswordRequest,
     db: Session = Depends(get_db)
 ):
-    import resend
-    import secrets
-    from datetime import timedelta
-
     resend.api_key = os.getenv("RESEND_API_KEY")
 
-    # Always return success even if email not found (security best practice)
     user = db.query(User).filter(User.email == data.email).first()
     if not user:
         return {"message": "If that email exists, a reset link has been sent"}
 
-    # Invalidate any existing unused tokens for this user
     db.query(PasswordResetToken).filter(
         PasswordResetToken.user_id == user.id,
         PasswordResetToken.used == False
     ).delete()
 
-    # Generate a secure token
     token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(hours=1)
 
@@ -298,14 +294,13 @@ async def forgot_password(
     db.add(reset_token)
     db.commit()
 
-    # Send email via Resend
     frontend_url = os.getenv("FRONTEND_URL", "https://docmind-frontend-eight.vercel.app")
     reset_link = f"{frontend_url}/reset-password?token={token}"
 
     try:
         resend.Emails.send({
             "from": "DocMind <onboarding@resend.dev>",
-            "to": user.email,
+            "to": [user.email],
             "subject": "Reset your DocMind password",
             "html": f"""
                 <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
@@ -329,7 +324,6 @@ async def forgot_password(
         })
     except Exception as e:
         print(f"Email send failed: {str(e)}")
-        # Still return success — don't expose email errors to client
 
     return {"message": "If that email exists, a reset link has been sent"}
 

@@ -623,6 +623,43 @@ async def get_messages(
         Message.conversation_id == conv_id
     ).order_by(Message.created_at.asc()).all()
 
+@app.get("/conversations/{conv_id}/export")
+async def export_conversation(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == current_user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    messages = db.query(Message).filter(
+        Message.conversation_id == conv_id
+    ).order_by(Message.created_at.asc()).all()
+
+    # Build markdown
+    lines = []
+    lines.append(f"# {conv.title}")
+    lines.append(f"*Exported from DocMind — {datetime.utcnow().strftime('%B %d, %Y')}*")
+    lines.append("")
+
+    for msg in messages:
+        if msg.role == "user":
+            lines.append(f"**You:** {msg.content}")
+        else:
+            lines.append(f"**DocMind:** {msg.content}")
+        lines.append("")
+
+    markdown = "\n".join(lines)
+
+    return {
+        "title": conv.title,
+        "markdown": markdown,
+        "message_count": len(messages)
+    }
 
 # ─────────────────────────────────────────
 # AI ENDPOINTS
@@ -875,3 +912,25 @@ async def get_document_chunks(
             for c in chunks
         ]
     }
+
+@app.patch("/documents/{doc_id}/tags")
+async def update_tags(
+    doc_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    tags = payload.get("tags", [])
+    # Normalize: lowercase, strip whitespace, remove duplicates
+    doc.tags = list(set(t.strip().lower() for t in tags if t.strip()))
+    doc.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(doc)
+    return {"id": doc_id, "tags": doc.tags}

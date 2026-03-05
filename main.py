@@ -370,6 +370,53 @@ async def reset_password(
 
     return {"message": "Password reset successfully"}
 
+@app.post("/auth/google")
+async def google_auth(
+    payload: dict,
+    db: Session = Depends(get_db)
+):
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+
+    credential = payload.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing Google credential")
+
+    try:
+        # Verify the Google token
+        google_client_id = os.getenv("GOOGLE_CLIENT_ID")
+        id_info = id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            google_client_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+
+    email = id_info.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Could not get email from Google account")
+
+    # Find or create user
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        # New user — create account with a random unusable password
+        import secrets as secrets_lib
+        user = User(
+            id=str(uuid.uuid4()),
+            email=email,
+            hashed_password=hash_password(secrets_lib.token_urlsafe(32))
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return TokenResponse(
+        access_token=create_access_token(user.id),
+        refresh_token=create_refresh_token(user.id),
+        token_type="bearer"
+    )
+
 @app.get("/auth/stats")
 async def get_stats(
     db: Session = Depends(get_db),

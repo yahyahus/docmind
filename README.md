@@ -347,8 +347,6 @@ For RAG applications the bottleneck is retrieval quality, not model size. GPT-4o
 
 ## Screenshots
 
-> Replace these placeholder images with actual screenshots before submitting to jobs.
-
 **Dashboard**
 ![Dashboard](/Screenshots/Dashboard.png)
 

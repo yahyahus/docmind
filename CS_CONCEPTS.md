@@ -46,23 +46,33 @@ in 1536-dimensional vector space using HNSW graph index.
 Each async function call pushes a frame onto the call stack.
 await suspends the frame until the promise resolves.
 
+### Two-Stage Retrieval (Re-ranking) (Week 6)
+**Where:** find_relevant_chunks() in ai.py
+**Area:** DSA — Search + Sorting Pipeline
+Stage 1: ANN search fetches 2x candidates (approximate, fast).
+Stage 2: exact cosine similarity recomputed in Python, results re-sorted.
+Threshold filter at 0.3 removes low-relevance results.
+Classic recall-then-precision pipeline pattern in information retrieval.
+
 ---
 
 ## 2. Database Systems
 
 ### Relational Model
-**Where:** All 5 tables
+**Where:** All 7 tables
 **Area:** DB Systems — Relational Algebra (E.F. Codd, 1970)
 Tables, rows, columns, relationships via foreign keys.
 
 ### Entity Relationship Design
-**Where:** 5-table schema
+**Where:** 7-table schema
 **Area:** DB Systems — ER Modeling
 ```
 users (1)──documents (many)
 users (1)──conversations (many)
 conversations (1)──messages (many)
 documents (1)──document_chunks (many)
+users (1)──password_reset_tokens (many)
+conversations (1)──share_links (1)
 ```
 
 ### ACID Properties
@@ -76,7 +86,7 @@ Atomicity, Consistency, Isolation, Durability on every commit.
 Maps to SELECT, WHERE, ORDER BY, LIMIT, OFFSET.
 
 ### Indexing (B-tree)
-**Where:** Primary keys, unique email constraint
+**Where:** Primary keys, unique email constraint, unique token constraint
 **Area:** DB Systems — Query Optimization
 PostgreSQL auto-creates B-tree index. O(log n) vs O(n) full scan.
 
@@ -92,7 +102,7 @@ neighbor search in high-dimensional spaces.
 SQL LIKE patterns — subset of regular expressions.
 
 ### Schema Migration
-**Where:** ALTER TABLE for new columns (is_processed, file_path etc.)
+**Where:** ALTER TABLE for new columns (is_processed, file_path, summary, document_ids etc.)
 **Area:** DB Systems — Schema Evolution
 create_all never alters existing tables. DDL statements required.
 
@@ -103,16 +113,23 @@ Cannot insert chunk without valid document_id.
 Cannot insert message without valid conversation_id.
 
 ### Cascading Operations
-**Where:** Delete conversation → delete all its messages
+**Where:** Delete conversation → delete all its messages; delete conversation → delete share_link
 **Area:** DB Systems — Referential Actions
 Must delete children before parent due to FK constraints.
+ON DELETE CASCADE automates this for share_links.
+
+### Token Expiry Pattern (Week 6)
+**Where:** password_reset_tokens.expires_at
+**Area:** DB Systems — Temporal Data
+Store expiry timestamp in DB, check at read time: WHERE expires_at > NOW() AND used = FALSE.
+Common pattern for invitation links, magic links, API keys.
 
 ---
 
 ## 3. Computer Networks
 
 ### HTTP Protocol
-**Where:** All 21 endpoints
+**Where:** All endpoints
 **Area:** Networks — Application Layer (RFC 7231)
 GET=Read, POST=Create, PATCH=Update, DELETE=Delete.
 
@@ -163,6 +180,22 @@ Hierarchical distributed system mapping names to IPs.
 **Area:** Networks — Content Delivery
 Static assets served from nearest edge node globally.
 
+### Server-Sent Events (SSE) (Week 5)
+**Where:** POST /conversations/{id}/chat/stream
+**Area:** Networks — HTTP Streaming / Push Protocols
+HTTP connection stays open. Server pushes data as available.
+Format: data: {json}\n\n per event. Connection closes on completion.
+Simpler than WebSockets for unidirectional streaming (server → client).
+Native browser support via EventSource API or ReadableStream.
+
+### ReadableStream API (Week 5)
+**Where:** Frontend chat/[id]/page.tsx handleSend()
+**Area:** Networks — Browser Streaming APIs
+response.body.getReader() returns a ReadableStream.
+reader.read() returns {value: Uint8Array, done: bool} chunks.
+TextDecoder converts bytes to strings.
+Lines split on \n\n — each line is one SSE event.
+
 ---
 
 ## 4. Operating Systems
@@ -193,6 +226,14 @@ Isolated Python interpreter with its own package directory.
 **Area:** OS — Process Management
 Process terminated after inactivity. New request triggers new process spawn.
 Wakeup ping mitigates this by keeping process warm.
+
+### Async Generator (Week 5)
+**Where:** async def generate() inside chat_stream endpoint
+**Area:** OS — Coroutines / Generator Protocol
+A function that yields values lazily without loading all into memory.
+yield pauses the coroutine and sends a value to the caller.
+FastAPI's StreamingResponse consumes the generator, pushing each yield to the client.
+Memory stays constant regardless of response length.
 
 ---
 
@@ -237,6 +278,35 @@ Current implementation uses accessible cookies for simplicity.
 **Area:** Security — AI Security
 Strict instructions prevent model manipulation via uploaded documents.
 
+### User Enumeration Attack Prevention (Week 6)
+**Where:** POST /auth/forgot-password
+**Area:** Security — Information Disclosure
+Always return the same response whether email exists or not.
+Attacker cannot determine which emails have accounts.
+Standard practice for all auth-related endpoints.
+
+### Token-Based Access Control (Week 6)
+**Where:** GET /share/{token}, password_reset_tokens
+**Area:** Security — Capability-Based Security
+A token IS the permission. Anyone who has it can use it.
+Security comes from entropy (256 bits for reset, 192 bits for share).
+Effectively impossible to guess — brute force would take longer than universe age.
+
+### OAuth 2.0 (Week 6)
+**Where:** POST /auth/google
+**Area:** Security — Delegated Authorization
+User authenticates with Google (trusted identity provider).
+Google issues a signed JWT credential (ID token).
+Backend verifies the signature without contacting Google again (uses Google's public keys).
+DocMind never sees the user's Google password.
+
+### Nonce / Single-Use Tokens (Week 6)
+**Where:** password_reset_tokens.used column
+**Area:** Security — Replay Attack Prevention
+Mark token as used after consumption.
+Prevents same token being used twice.
+Invalidate previous tokens when new one is requested (prevents parallel races).
+
 ---
 
 ## 6. Artificial Intelligence & Machine Learning
@@ -248,11 +318,12 @@ Text → 1536 floats capturing semantic meaning.
 Trained neural network maps linguistic meaning to geometric space.
 
 ### Cosine Similarity
-**Where:** pgvector <=> operator
+**Where:** pgvector <=> operator + cosine_similarity() in ai.py
 **Area:** ML / Linear Algebra — Similarity Metrics
 cos(θ) = (A·B) / (|A||B|)
 Measures angle between vectors — ignores magnitude, captures direction.
 1.0 = identical meaning, 0.0 = unrelated.
+Used in re-ranking to score retrieved chunks against query embedding.
 
 ### Large Language Models
 **Where:** GPT-4o-mini via OpenAI chat completions
@@ -272,12 +343,20 @@ Embedding whole doc = diluted vector.
 Embedding 400-word chunk = focused vector per topic.
 Overlap prevents context loss at boundaries.
 
+### Semantic Chunking (Week 6)
+**Where:** split_into_sentences() + chunk_text() rewrite in ai.py
+**Area:** ML — Document Processing
+Fixed word-count chunking cuts mid-sentence — embedding captures incomplete thought.
+Semantic chunking: split on paragraph boundaries → sentence boundaries → group to target size.
+Preserves topical coherence within each chunk.
+More accurate embeddings → better retrieval → fewer irrelevant answers.
+
 ### Hallucination Prevention
 **Where:** System prompt + "Answer ONLY based on context"
 **Area:** ML — AI Alignment / Prompt Engineering
 LLMs hallucinate when generating from training data without grounding.
 RAG + strict prompt rules force document-grounded responses.
-Tested: "What is capital of France" → correct refusal.
+Tested: "price of mycelium leather products" → correct refusal.
 
 ### Semantic Search vs Keyword Search
 **Where:** pgvector vs ILIKE
@@ -285,6 +364,22 @@ Tested: "What is capital of France" → correct refusal.
 Keyword: matches exact strings — fast, brittle.
 Semantic: matches meaning — "weaknesses" finds "limitations".
 DocMind implements both — user can choose approach.
+
+### Streaming Token Generation (Week 5)
+**Where:** OpenAI stream=True + SSE endpoint
+**Area:** ML — LLM Inference
+LLMs generate one token at a time autoregressively.
+Streaming exposes this token-by-token generation to the user.
+Without streaming: wait for all tokens → receive response.
+With streaming: receive each token as generated → feels instant.
+
+### Context Window Management (Week 5)
+**Where:** Multi-doc chat, conversation history
+**Area:** ML — LLM Context
+GPT-4o-mini has 128k token context window.
+DocMind sends: system prompt + context chunks + last 10 messages + question.
+Per-doc retrieval (3 chunks/doc) prevents any single doc dominating the window.
+History limited to 10 messages prevents unbounded context growth.
 
 ---
 
@@ -332,19 +427,34 @@ Every request goes through interceptor automatically.
 **Area:** SE — Component Architecture
 UI as composable, reusable, isolated units with local state.
 
+### Backwards Compatibility (Week 5)
+**Where:** document_id kept alongside document_ids
+**Area:** SE — API Design
+Never remove fields from a live API — existing clients break.
+Add new fields alongside old ones. Old field stays as fallback.
+Critical when evolving a schema with existing production data.
+
+### Graceful Degradation / Fallback (Week 6)
+**Where:** Re-ranking fallback — return unfiltered results if all below threshold
+**Area:** SE — Resilience Engineering
+System never completely fails — provides best available result.
+Instead of returning empty on low confidence, returns top results with caveat.
+
 ---
 
 ## 8. Theory of Computation
 
 ### Pattern Matching
-**Where:** ILIKE %keyword% search
+**Where:** ILIKE %keyword% search, sentence boundary regex
 **Area:** ToC — Formal Languages
 SQL LIKE = subset of regular expressions = finite automata recognizable.
+re.split(r'(?<=[.!?])\s+(?=[A-Z])') — lookbehind + lookahead assertions.
 
 ### Finite State Machines
-**Where:** Document processing states, conversation lifecycle
+**Where:** Document processing states, conversation lifecycle, token states
 **Area:** ToC — Automata
 Document: unprocessed → processed → deleted.
+Reset token: active → used / active → expired.
 HTTP lifecycle: request → processing → response.
 
 ### One-Way Functions
@@ -364,15 +474,15 @@ HNSW approximates nearest neighbor efficiently in high dimensions.
 ## Concept Count by Area
 | CS Area | Concepts Applied |
 |---------|----------------|
-| Data Structures & Algorithms | 7 |
-| Database Systems | 10 |
-| Computer Networks | 9 |
-| Operating Systems | 5 |
-| Security & Cryptography | 7 |
-| AI & Machine Learning | 7 |
-| Software Engineering | 8 |
+| Data Structures & Algorithms | 8 |
+| Database Systems | 11 |
+| Computer Networks | 12 |
+| Operating Systems | 6 |
+| Security & Cryptography | 11 |
+| AI & Machine Learning | 10 |
+| Software Engineering | 10 |
 | Theory of Computation | 4 |
-| **Total** | **57** |
+| **Total** | **72** |
 
 ---
 
@@ -404,3 +514,31 @@ Cross-Origin Resource Sharing. Browsers block JavaScript from calling
 APIs on different domains by default (security policy).
 Frontend on vercel.app calling backend on onrender.com = different origins.
 CORSMiddleware adds response headers telling the browser it's allowed.
+
+### "Why SSE instead of WebSockets for streaming?" (Week 5)
+SSE is unidirectional — perfect for token streaming where only the server sends data.
+WebSockets are bidirectional — add complexity we don't need.
+SSE works over standard HTTP (no protocol upgrade).
+SSE is simpler to implement, simpler to debug, and sufficient for this use case.
+
+### "How does your re-ranking improve retrieval?" (Week 6)
+pgvector ANN search is fast but approximate — results aren't perfectly ordered.
+We fetch 2x candidates, then recompute exact cosine similarity in Python.
+This gives us a precision-ranked list instead of an approximate one.
+We also filter below 0.3 threshold so only relevant chunks reach the LLM.
+
+### "What is the hardest bug you fixed?"
+The summary not saving bug: process_document was running, generate_summary was
+running (visible in logs), db.commit() was called — but summary column stayed null.
+Root cause: the summary column existed in PostgreSQL but NOT in the SQLAlchemy model.
+SQLAlchemy silently ignored the assignment. Lesson: always add new DB columns to
+both the SQL table AND the SQLAlchemy model.
+
+### "How did you handle Google OAuth?"
+Instead of the full redirect flow, we use the credential flow.
+@react-oauth/google gives the user a Google Sign-In button.
+On success, Google issues a signed JWT (ID token) to the browser.
+Browser sends this to our backend's POST /auth/google.
+We verify the signature using Google's public keys via google.oauth2.id_token.verify_oauth2_token().
+If valid, we extract the email, find or create the user, and return our own JWT.
+Google never sees our backend — we just trust the token's signature.

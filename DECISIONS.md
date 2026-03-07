@@ -20,6 +20,10 @@ Imagine you run a library with an AI research assistant:
 - **JWT tokens** = the library card proving who you are
 - **Next.js** = the library's public-facing reception desk
 - **Axios interceptors** = the staff member who automatically shows your library card on every visit
+- **SSE (streaming)** = the assistant whispering each word as they think of it rather than waiting to finish the whole answer
+- **Resend** = the postal service that delivers password reset letters
+- **Google OAuth** = letting users show their Google ID card instead of creating a new library card
+- **Share links** = a photocopy of a conversation anyone can read without a library card
 
 ---
 
@@ -93,6 +97,21 @@ Without overlap: a sentence split across chunk boundary loses context.
 With overlap: the boundary content appears in both chunks — never lost.
 Smaller chunks = more focused embeddings = better retrieval accuracy.
 
+### Semantic Chunking over Fixed Word-Count Chunking (Week 6)
+Fixed-size chunking cuts mid-sentence and mid-paragraph — the embedding
+captures half an idea. Semantic chunking splits on paragraph boundaries
+first, then sentence boundaries, grouping units up to 400 words.
+This preserves topical coherence within each chunk.
+Result: more accurate embeddings, better retrieval, fewer irrelevant answers.
+
+### Two-Stage Retrieval with Re-ranking (Week 6)
+pgvector's <=> operator uses approximate nearest neighbor search —
+fast but not perfectly ordered. After fetching 2x candidates, exact
+cosine similarity is re-computed in Python and results re-sorted.
+Chunks below 0.3 threshold are filtered out.
+Fallback: if all below threshold, return top results anyway so system never silently fails.
+Cost: slightly more computation. Benefit: meaningfully better precision.
+
 ### RAG over Fine-tuning
 Fine-tuning trains the model on your data permanently — expensive,
 slow, and the model can't be updated without retraining.
@@ -104,7 +123,72 @@ RAG is the industry standard for document Q&A applications.
 Without strict rules GPT will hallucinate answers from its training data.
 The rule "if not in context, say I don't have enough information"
 forces the model to stay grounded in the document.
-Tested and confirmed — capital of France returned correct refusal.
+Tested and confirmed — "price of mycelium leather products" returned correct refusal.
+
+### SSE over WebSockets for Streaming (Week 5)
+SSE is unidirectional server-to-client, which is exactly what token
+streaming needs. WebSockets add bidirectional overhead and complexity.
+SSE works over standard HTTP, is natively supported by ReadableStream,
+and is simpler to implement in FastAPI via StreamingResponse.
+Chosen because the client only sends one POST and then listens —
+no need for a persistent two-way socket.
+
+### jsPDF Direct Download over window.print() (Week 6)
+window.print() opens the browser print dialog — not what users expect
+from an "Export PDF" button. jsPDF generates the PDF file directly in
+browser memory and triggers a real file download. No dialog, no paper
+size confusion, no user friction.
+
+### Per-Document Tag Normalization on Backend (Week 6)
+Lowercase, strip whitespace, deduplicate — done in the PATCH endpoint,
+not in the frontend form handler. Ensures consistency regardless of
+how tags are submitted — from the frontend, from the API directly,
+or from future integrations. Frontend can't be trusted to normalize.
+
+### Always Return Success on Forgot-Password (Week 6)
+The endpoint returns the same message whether the email exists or not.
+This prevents user enumeration attacks — if we returned "Email not found",
+an attacker could discover which emails have accounts.
+Security best practice: never reveal account existence to unauthenticated callers.
+
+### Single-Use Expiring Reset Tokens (Week 6)
+Reset tokens use secrets.token_urlsafe(32) for 256-bit entropy.
+Expire after 1 hour. Marked used=True after consumption.
+Existing unused tokens for a user are invalidated when a new reset is requested.
+This prevents token reuse, stale token attacks, and parallel reset races.
+
+### Token-Based Public Share Links (Week 6)
+GET /share/{token} requires no JWT — anyone with the token can view.
+The token's randomness (urlsafe 24 bytes = 192 bits of entropy) is
+the sole access control. ON DELETE CASCADE means revoking a conversation
+also removes its share link automatically — no orphaned tokens.
+
+### Google OAuth via Frontend Credential + Backend Verification (Week 6)
+The frontend gets a Google-issued JWT using @react-oauth/google,
+sends it to the backend, which verifies it with
+google.oauth2.id_token.verify_oauth2_token().
+Simpler than a full redirect flow — no OAuth state management,
+no callback routes, no CSRF tokens needed.
+Google handles the user-facing login UI entirely.
+
+### Find-or-Create for Google OAuth Users (Week 6)
+When a Google user signs in for the first time, an account is auto-created
+with a random unusable hashed password. Email/password login is impossible
+for these accounts by design — users who register via Google always sign
+in via Google. This is the correct pattern: accounts are unified by email.
+
+### Keeping document_id Alongside document_ids (Week 5)
+When multi-doc chat was added, the original document_id column was kept
+for backwards compatibility. New conversations populate both fields.
+document_ids is the source of truth. document_id holds the first document
+for legacy reads. Removing document_id would require a migration and
+would break existing conversations.
+
+### Per-Document Chunk Retrieval for Multi-Doc (Week 5)
+Rather than pooling all chunks before retrieval, chunks are fetched
+per document (3 per doc default), then combined into unified context.
+This prevents one large document from dominating the context window
+and ensures representation from each selected document.
 
 ### Next.js over React (plain)
 App Router provides file-based routing — no react-router setup needed.
@@ -147,6 +231,14 @@ First request after sleep takes 30-60 seconds.
 Pinging /health on dashboard load gives backend a head start.
 Silently fails if backend is already awake — no user impact.
 
+### Pinned requirements.txt (Week 6)
+All Python dependencies pinned to exact versions to prevent build failures
+from upstream breaking changes.
+Conflicts encountered and resolved:
+- resend==0.28.0 doesn't exist → fixed to 2.23.0
+- resend v2 changed "to" field from string to list → [user.email]
+- google-auth 2.40.0 conflicts with cachetools==6.2.6 → downgraded cachetools to 5.5.2
+
 ---
 
 ## Decision Log (Chronological)
@@ -173,3 +265,35 @@ Silently fails if backend is already awake — no user impact.
 | 7 | Pathname check in interceptor | Login 401 must not redirect |
 | 7 | Optimistic UI in chat | Perceived performance |
 | 7 | Wakeup ping on dashboard | Render cold start mitigation |
+| W5 | SSE over WebSockets | Unidirectional, simpler, sufficient |
+| W5 | Streaming endpoint separate | Non-breaking — existing /chat preserved |
+| W5 | document_ids + keep document_id | Backwards compatibility |
+| W5 | Per-doc chunk retrieval | Prevent large doc dominating context |
+| W5 | Auto-summary on process | No extra user action needed |
+| W6 | Semantic chunking | Paragraph/sentence boundaries > word count |
+| W6 | Re-ranking + 0.3 threshold | Exact cosine > ANN approximation |
+| W6 | jsPDF over window.print() | Real download, no dialog |
+| W6 | Tags normalized on backend | Frontend can't be trusted |
+| W6 | limit=50 for document list | Was 10 — silently cut off documents |
+| W6 | Always return success on forgot-pw | Prevent user enumeration |
+| W6 | Single-use expiring tokens | Prevent reuse + stale token attacks |
+| W6 | Token-based share links (public) | Entropy as access control |
+| W6 | ON DELETE CASCADE on share_links | No orphaned tokens |
+| W6 | Google OAuth credential flow | No redirect flow complexity |
+| W6 | Find-or-create for Google users | Unified account by email |
+| W6 | resend==2.23.0 | 0.28.0 doesn't exist |
+| W6 | cachetools==5.5.2 | google-auth 2.40.0 conflict fix |
+
+---
+
+## What Would Change at Production Scale
+| Current | Production alternative | Reason |
+|---|---|---|
+| Single main.py | FastAPI routers by domain | Maintainability |
+| No rate limiting | SlowAPI or API gateway | Abuse prevention |
+| allow_origins=["*"] | Explicit origin whitelist | Security |
+| limit=50 on list endpoints | Cursor-based pagination | Scalability |
+| Supabase free tier | Dedicated PostgreSQL | Connection limits |
+| Render free tier | Paid instance | No cold starts |
+| In-process streaming | Celery + Redis queue | Reliability at scale |
+| js-cookie (accessible) | httpOnly server-set cookies | XSS protection |

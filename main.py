@@ -15,22 +15,26 @@ WHAT THIS FILE DOES NOT DO:
 - Does not talk to external services directly
 
 IMPORTS FROM:
-- database.py → Document, User, get_db
+- database.py → Document, User, DocumentVersion, get_db
 - auth.py → hash_password, verify_password, create_access_token,
              create_refresh_token, get_current_user
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from datetime import datetime
+from sqlalchemy import func
+from datetime import datetime, timedelta
 from typing import Optional
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import uuid
 import os
 import io
@@ -38,15 +42,17 @@ import json
 import PyPDF2
 import resend
 import secrets
-from datetime import timedelta
-
 
 from ai import (
     process_document, generate_rag_response, generate_summary,
     client, find_relevant_chunks, find_relevant_chunks_multi,
-    get_conversation_history, build_messages
+    get_conversation_history, build_messages,
+    semantic_search_documents, generate_conversation_title
 )
-from database import Document, User, Conversation, Message, DocumentChunk, PasswordResetToken, ShareLink, get_db
+from database import (
+    Document, User, Conversation, Message, DocumentChunk,
+    PasswordResetToken, ShareLink, DocumentVersion, get_db
+)
 from auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
@@ -60,6 +66,11 @@ load_dotenv()
 # ─────────────────────────────────────────
 
 app = FastAPI(title="DocMind API", version="1.0.0")
+
+# Rate limiter — keyed by client IP address
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,6 +208,7 @@ class ShareLinkResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 # ─────────────────────────────────────────
 # ROOT + HEALTH
 # ─────────────────────────────────────────
@@ -242,7 +254,9 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
     return user
 
 @app.post("/auth/login", response_model=TokenResponse)
+@limiter.limit("20/minute")
 async def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
@@ -278,7 +292,9 @@ async def change_password(
     return {"message": "Password changed successfully"}
 
 @app.post("/auth/forgot-password")
+@limiter.limit("5/hour")
 async def forgot_password(
+    request: Request,
     data: ForgotPasswordRequest,
     db: Session = Depends(get_db)
 ):
@@ -286,6 +302,7 @@ async def forgot_password(
 
     user = db.query(User).filter(User.email == data.email).first()
     if not user:
+        # Always return success — prevents user enumeration attacks
         return {"message": "If that email exists, a reset link has been sent"}
 
     db.query(PasswordResetToken).filter(
@@ -360,11 +377,8 @@ async def reset_password(
     if len(data.new_password) > 72:
         raise HTTPException(status_code=400, detail="Password must be 72 characters or less")
 
-    # Update password
     user = db.query(User).filter(User.id == reset_token.user_id).first()
     user.hashed_password = hash_password(data.new_password)
-
-    # Mark token as used
     reset_token.used = True
     db.commit()
 
@@ -383,7 +397,6 @@ async def google_auth(
         raise HTTPException(status_code=400, detail="Missing Google credential")
 
     try:
-        # Verify the Google token
         google_client_id = os.getenv("GOOGLE_CLIENT_ID")
         id_info = id_token.verify_oauth2_token(
             credential,
@@ -397,10 +410,9 @@ async def google_auth(
     if not email:
         raise HTTPException(status_code=400, detail="Could not get email from Google account")
 
-    # Find or create user
+    # Find or create — accounts unified by email
     user = db.query(User).filter(User.email == email).first()
     if not user:
-        # New user — create account with a random unusable password
         import secrets as secrets_lib
         user = User(
             id=str(uuid.uuid4()),
@@ -442,6 +454,7 @@ async def get_stats(
         "member_since": current_user.created_at,
     }
 
+
 # ─────────────────────────────────────────
 # DOCUMENT ENDPOINTS
 # ─────────────────────────────────────────
@@ -475,6 +488,9 @@ async def list_documents(
         Document.user_id == current_user.id
     ).offset(offset).limit(limit).all()
 
+# NOTE: /documents/search and /documents/semantic-search must stay
+# ABOVE /documents/{doc_id} — FastAPI matches routes top-down.
+
 @app.get("/documents/search", response_model=list[DocumentResponse])
 async def search_documents(
     q: str,
@@ -499,6 +515,40 @@ async def search_documents(
     ).offset(offset).limit(limit).all()
 
     return results
+
+@app.get("/documents/semantic-search", response_model=list[DocumentResponse])
+async def semantic_search(
+    q: str,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Embeds the query and ranks documents by cosine similarity of their chunks.
+    Only searches within processed documents (those that have chunks).
+    Returns results sorted best-match first.
+    """
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    ranked = semantic_search_documents(
+        query=q.strip(),
+        user_id=current_user.id,
+        db=db,
+        limit=limit,
+    )
+
+    if not ranked:
+        return []
+
+    doc_ids  = [r["document_id"] for r in ranked]
+    docs_raw = db.query(Document).filter(
+        Document.id.in_(doc_ids),
+        Document.user_id == current_user.id,
+    ).all()
+
+    doc_map = {d.id: d for d in docs_raw}
+    return [doc_map[r["document_id"]] for r in ranked if r["document_id"] in doc_map]
 
 @app.get("/documents/{doc_id}", response_model=DocumentResponse)
 async def get_document(
@@ -553,22 +603,12 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete chunks first (FK constraint)
-    db.query(DocumentChunk).filter(
-        DocumentChunk.document_id == doc_id
-    ).delete()
+    db.query(DocumentChunk).filter(DocumentChunk.document_id == doc_id).delete()
 
-    # Delete linked conversations and their messages
-    convs = db.query(Conversation).filter(
-        Conversation.document_id == doc_id
-    ).all()
+    convs = db.query(Conversation).filter(Conversation.document_id == doc_id).all()
     for conv in convs:
-        db.query(Message).filter(
-            Message.conversation_id == conv.id
-        ).delete()
-    db.query(Conversation).filter(
-        Conversation.document_id == doc_id
-    ).delete()
+        db.query(Message).filter(Message.conversation_id == conv.id).delete()
+    db.query(Conversation).filter(Conversation.document_id == doc_id).delete()
 
     db.delete(doc)
     db.commit()
@@ -653,6 +693,172 @@ async def upload_document(
 
 
 # ─────────────────────────────────────────
+# DOCUMENT VERSIONING ENDPOINTS
+# ─────────────────────────────────────────
+
+@app.post("/documents/{doc_id}/version", response_model=DocumentResponse)
+async def upload_new_version(
+    doc_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Upload a replacement file for an existing document.
+    Snapshots the current content as a numbered version before overwriting.
+    Sets is_processed=False — the new version must be re-processed to rebuild embeddings.
+    """
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if file.content_type not in ["application/pdf", "text/plain"]:
+        raise HTTPException(status_code=400, detail="Only PDF and TXT files allowed")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max 5 MB.")
+
+    if file.content_type == "application/pdf":
+        new_content = extract_text_from_pdf(file_bytes)
+        if not new_content:
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        file_type = "pdf"
+    else:
+        new_content = file_bytes.decode("utf-8")
+        file_type = "txt"
+
+    new_path = f"{current_user.id}/{uuid.uuid4()}/{file.filename}"
+    try:
+        upload_to_supabase(file_bytes, new_path, file.content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+
+    # Snapshot current state before overwriting
+    max_ver = db.query(func.max(DocumentVersion.version_number)).filter(
+        DocumentVersion.document_id == doc_id
+    ).scalar() or 0
+
+    snapshot = DocumentVersion(
+        id=str(uuid.uuid4()),
+        document_id=doc_id,
+        user_id=current_user.id,
+        version_number=max_ver + 1,
+        content=doc.content,
+        file_path=doc.file_path,
+        file_type=doc.file_type,
+        summary=doc.summary,
+    )
+    db.add(snapshot)
+
+    # Overwrite document with new content
+    doc.content      = new_content
+    doc.file_path    = new_path
+    doc.file_type    = file_type
+    doc.is_processed = False
+    doc.summary      = None
+    doc.updated_at   = datetime.utcnow()
+
+    # Delete stale chunks — they belong to the old content
+    db.query(DocumentChunk).filter(DocumentChunk.document_id == doc_id).delete()
+
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+@app.get("/documents/{doc_id}/versions")
+async def get_document_versions(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    versions = (
+        db.query(DocumentVersion)
+        .filter(DocumentVersion.document_id == doc_id)
+        .order_by(DocumentVersion.version_number.desc())
+        .all()
+    )
+
+    return {
+        "document_id":     doc_id,
+        "current_version": len(versions) + 1,
+        "versions": [
+            {
+                "version_number": v.version_number,
+                "created_at":     v.created_at,
+                "summary":        v.summary,
+                "file_type":      v.file_type,
+            }
+            for v in versions
+        ],
+    }
+
+
+@app.post("/documents/{doc_id}/versions/{version_number}/restore", response_model=DocumentResponse)
+async def restore_document_version(
+    doc_id: str,
+    version_number: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    version = db.query(DocumentVersion).filter(
+        DocumentVersion.document_id == doc_id,
+        DocumentVersion.version_number == version_number
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    # Snapshot current state before restoring (so restore is reversible)
+    max_ver = db.query(func.max(DocumentVersion.version_number)).filter(
+        DocumentVersion.document_id == doc_id
+    ).scalar() or 0
+
+    snapshot = DocumentVersion(
+        id=str(uuid.uuid4()),
+        document_id=doc_id,
+        user_id=current_user.id,
+        version_number=max_ver + 1,
+        content=doc.content,
+        file_path=doc.file_path,
+        file_type=doc.file_type,
+        summary=doc.summary,
+    )
+    db.add(snapshot)
+
+    # Restore
+    doc.content      = version.content
+    doc.file_path    = version.file_path
+    doc.file_type    = version.file_type
+    doc.summary      = version.summary
+    doc.is_processed = False
+    doc.updated_at   = datetime.utcnow()
+
+    db.query(DocumentChunk).filter(DocumentChunk.document_id == doc_id).delete()
+
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+# ─────────────────────────────────────────
 # CONVERSATION ENDPOINTS
 # ─────────────────────────────────────────
 
@@ -662,12 +868,10 @@ async def create_conversation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Normalize — if document_id provided, include it in document_ids too
     doc_ids = list(conv.document_ids or [])
     if conv.document_id and conv.document_id not in doc_ids:
         doc_ids = [conv.document_id] + doc_ids
 
-    # Verify all documents belong to this user and are processed
     for did in doc_ids:
         doc = db.query(Document).filter(
             Document.id == did,
@@ -800,7 +1004,6 @@ async def export_conversation(
         Message.conversation_id == conv_id
     ).order_by(Message.created_at.asc()).all()
 
-    # Build markdown
     lines = []
     lines.append(f"# {conv.title}")
     lines.append(f"*Exported from DocMind — {datetime.utcnow().strftime('%B %d, %Y')}*")
@@ -813,11 +1016,9 @@ async def export_conversation(
             lines.append(f"**DocMind:** {msg.content}")
         lines.append("")
 
-    markdown = "\n".join(lines)
-
     return {
         "title": conv.title,
-        "markdown": markdown,
+        "markdown": "\n".join(lines),
         "message_count": len(messages)
     }
 
@@ -834,10 +1035,7 @@ async def create_share_link(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Return existing share link if one exists
-    existing = db.query(ShareLink).filter(
-        ShareLink.conversation_id == conv_id
-    ).first()
+    existing = db.query(ShareLink).filter(ShareLink.conversation_id == conv_id).first()
     if existing:
         frontend_url = os.getenv("FRONTEND_URL", "https://docmind-frontend-eight.vercel.app")
         return {
@@ -866,7 +1064,6 @@ async def create_share_link(
         "created_at": share.created_at
     }
 
-
 @app.delete("/conversations/{conv_id}/share")
 async def revoke_share_link(
     conv_id: str,
@@ -880,28 +1077,20 @@ async def revoke_share_link(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    db.query(ShareLink).filter(
-        ShareLink.conversation_id == conv_id
-    ).delete()
+    db.query(ShareLink).filter(ShareLink.conversation_id == conv_id).delete()
     db.commit()
     return {"message": "Share link revoked"}
-
 
 @app.get("/share/{token}")
 async def get_shared_conversation(
     token: str,
     db: Session = Depends(get_db)
 ):
-    share = db.query(ShareLink).filter(
-        ShareLink.token == token
-    ).first()
+    share = db.query(ShareLink).filter(ShareLink.token == token).first()
     if not share:
         raise HTTPException(status_code=404, detail="Share link not found or revoked")
 
-    conv = db.query(Conversation).filter(
-        Conversation.id == share.conversation_id
-    ).first()
-
+    conv = db.query(Conversation).filter(Conversation.id == share.conversation_id).first()
     messages = db.query(Message).filter(
         Message.conversation_id == share.conversation_id
     ).order_by(Message.created_at.asc()).all()
@@ -915,12 +1104,15 @@ async def get_shared_conversation(
         ]
     }
 
+
 # ─────────────────────────────────────────
 # AI ENDPOINTS
 # ─────────────────────────────────────────
 
 @app.post("/documents/{doc_id}/process")
+@limiter.limit("10/hour")
 async def process_document_endpoint(
+    request: Request,
     doc_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -961,6 +1153,29 @@ async def process_document_endpoint(
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
+def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
+    """
+    Generate and save a conversation title after the first user message.
+    Fires only once — on the message that brings the user count to 1.
+    Silent failure — title errors must never break chat.
+    """
+    try:
+        user_msg_count = db.query(Message).filter(
+            Message.conversation_id == conv.id,
+            Message.role == "user"
+        ).count()
+        if user_msg_count == 1:
+            doc_titles = []
+            for did in doc_ids:
+                d = db.query(Document).filter(Document.id == did).first()
+                if d:
+                    doc_titles.append(d.title)
+            conv.title = generate_conversation_title(message_content, doc_titles)
+            db.commit()
+    except Exception:
+        pass
+
+
 @app.post("/conversations/{conv_id}/chat", response_model=MessageResponse)
 async def chat(
     conv_id: str,
@@ -968,8 +1183,6 @@ async def chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    import uuid as uuid_lib
-
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -977,7 +1190,6 @@ async def chat(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Support both single and multi-doc conversations
     doc_ids = conv.document_ids if conv.document_ids else ([conv.document_id] if conv.document_id else [])
     if not doc_ids:
         raise HTTPException(status_code=400, detail="Conversation has no linked documents.")
@@ -987,9 +1199,8 @@ async def chat(
         if not d or not d.is_processed:
             raise HTTPException(status_code=400, detail="Document not processed yet.")
 
-    # Save user message
     user_message = Message(
-        id=str(uuid_lib.uuid4()),
+        id=str(uuid.uuid4()),
         conversation_id=conv_id,
         role="user",
         content=message.content
@@ -997,7 +1208,9 @@ async def chat(
     db.add(user_message)
     db.commit()
 
-    # Generate AI response — single or multi doc
+    # Auto-title on first message
+    _auto_title(conv, doc_ids, message.content, db)
+
     try:
         if len(doc_ids) == 1:
             ai_response = generate_rag_response(
@@ -1028,9 +1241,8 @@ async def chat(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
 
-    # Save assistant message
     assistant_message = Message(
-        id=str(uuid_lib.uuid4()),
+        id=str(uuid.uuid4()),
         conversation_id=conv_id,
         role="assistant",
         content=ai_response
@@ -1043,14 +1255,14 @@ async def chat(
 
 
 @app.post("/conversations/{conv_id}/chat/stream")
+@limiter.limit("60/minute")
 async def chat_stream(
+    request: Request,
     conv_id: str,
     message: MessageCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    import uuid as uuid_lib
-
     conv = db.query(Conversation).filter(
         Conversation.id == conv_id,
         Conversation.user_id == current_user.id
@@ -1058,7 +1270,6 @@ async def chat_stream(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Support both single and multi-doc conversations
     doc_ids = conv.document_ids if conv.document_ids else ([conv.document_id] if conv.document_id else [])
     if not doc_ids:
         raise HTTPException(status_code=400, detail="Conversation has no linked documents.")
@@ -1068,9 +1279,8 @@ async def chat_stream(
         if not d or not d.is_processed:
             raise HTTPException(status_code=400, detail="Document not processed yet.")
 
-    # Save user message
     user_message = Message(
-        id=str(uuid_lib.uuid4()),
+        id=str(uuid.uuid4()),
         conversation_id=conv_id,
         role="user",
         content=message.content
@@ -1078,7 +1288,9 @@ async def chat_stream(
     db.add(user_message)
     db.commit()
 
-    # Get relevant chunks — single or multi doc
+    # Auto-title on first message
+    _auto_title(conv, doc_ids, message.content, db)
+
     if len(doc_ids) == 1:
         chunks = find_relevant_chunks(
             question=message.content,
@@ -1097,7 +1309,7 @@ async def chat_stream(
     context = "\n\n---\n\n".join(chunks) if chunks else "No relevant context found."
     history = get_conversation_history(conv_id, db)
     messages_for_ai = build_messages(context, history, message.content)
-    assistant_id = str(uuid_lib.uuid4())
+    assistant_id = str(uuid.uuid4())
 
     async def generate():
         full_response = ""
@@ -1115,7 +1327,6 @@ async def chat_stream(
                     full_response += delta
                     yield f"data: {json.dumps({'content': delta})}\n\n"
 
-            # Save complete response after streaming finishes
             assistant_message = Message(
                 id=assistant_id,
                 conversation_id=conv_id,

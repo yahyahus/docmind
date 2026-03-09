@@ -361,3 +361,54 @@ Summary:"""
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
+
+def semantic_search_documents(query: str, user_id: str, db, limit: int = 10) -> list:
+    query_embedding = get_embedding(query)
+
+    rows = db.execute(text("""
+        SELECT
+            dc.document_id,
+            MIN(dc.embedding <=> CAST(:embedding AS vector)) AS best_distance
+        FROM document_chunks dc
+        WHERE dc.user_id = :user_id
+        GROUP BY dc.document_id
+        ORDER BY best_distance ASC
+        LIMIT :limit
+    """), {
+        "embedding": str(query_embedding),
+        "user_id":   user_id,
+        "limit":     limit,
+    }).fetchall()
+
+    # Convert cosine distance → similarity score (1 = identical)
+    return [{"document_id": row[0], "score": round(1 - row[1], 4)} for row in rows]
+
+def generate_conversation_title(first_message: str, document_titles: list) -> str:
+    doc_context = ", ".join(document_titles[:3]) if document_titles else "a document"
+
+    prompt = (
+        f"Generate a SHORT conversation title (maximum 6 words).\n"
+        f"User's first message: \"{first_message[:200]}\"\n"
+        f"Document(s): {doc_context}\n\n"
+        f"Rules:\n"
+        f"- 6 words maximum\n"
+        f"- No quotes, no trailing punctuation\n"
+        f"- Be specific to what the user asked\n"
+        f"- Do NOT start with 'Chat about' or 'Discussion of'\n\n"
+        f"Title:"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=20,
+        temperature=0.7,
+    )
+
+    title = response.choices[0].message.content.strip().strip('"').strip("'")
+
+    # Safety fallback — if model ignores the word limit
+    if len(title.split()) > 8:
+        return (first_message[:47] + "...") if len(first_message) > 50 else first_message
+
+    return title

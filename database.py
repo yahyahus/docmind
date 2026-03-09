@@ -131,6 +131,19 @@ class ShareLink(Base):
     token = Column(String, unique=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+
+    id             = Column(String,  primary_key=True)
+    document_id    = Column(String,  ForeignKey("documents.id"))
+    user_id        = Column(String,  ForeignKey("users.id"))
+    version_number = Column(Integer, nullable=False)
+    content        = Column(Text,    nullable=True)
+    file_path      = Column(String,  nullable=True)
+    file_type      = Column(String,  nullable=True)
+    summary        = Column(Text,    nullable=True)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+
 def get_db():
     db = SessionLocal()
     try:

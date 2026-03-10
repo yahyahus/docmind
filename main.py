@@ -20,9 +20,9 @@ IMPORTS FROM:
              create_refresh_token, get_current_user
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+# from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
@@ -307,7 +307,7 @@ async def forgot_password(
 
     db.query(PasswordResetToken).filter(
         PasswordResetToken.user_id == user.id,
-        PasswordResetToken.used == False
+        PasswordResetToken.used.is_(False)
     ).delete()
 
     token = secrets.token_urlsafe(32)
@@ -363,7 +363,7 @@ async def reset_password(
 ):
     reset_token = db.query(PasswordResetToken).filter(
         PasswordResetToken.token == data.token,
-        PasswordResetToken.used == False
+        PasswordResetToken.used.is_(False)
     ).first()
 
     if not reset_token:
@@ -437,7 +437,7 @@ async def get_stats(
     doc_count = db.query(Document).filter(Document.user_id == current_user.id).count()
     processed_count = db.query(Document).filter(
         Document.user_id == current_user.id,
-        Document.is_processed == True
+        Document.is_processed.is_(True)
     ).count()
     conv_count = db.query(Conversation).filter(Conversation.user_id == current_user.id).count()
     msg_count = db.query(Message).join(Conversation).filter(

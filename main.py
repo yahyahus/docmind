@@ -1176,7 +1176,7 @@ def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
             db.commit()
             print(f"AUTO_TITLE: committed successfully")
     except Exception:
-        print(f"AUTO_TITLE ERROR: {e}")
+        # print(f"AUTO_TITLE ERROR: {e}")
         pass
 
 

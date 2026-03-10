@@ -1164,7 +1164,7 @@ def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
             Message.conversation_id == conv.id,
             Message.role == "user"
         ).count()
-        print(f"AUTO_TITLE: user_msg_count={user_msg_count}, conv_id={conv.id}")
+        print("AUTO_TITLE: user_msg_count={user_msg_count}, conv_id={conv.id}")
         if user_msg_count == 1:
             doc_titles = []
             for did in doc_ids:
@@ -1172,9 +1172,9 @@ def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
                 if d:
                     doc_titles.append(d.title)
             conv.title = generate_conversation_title(message_content, doc_titles)
-            print(f"AUTO_TITLE: generated='{conv.title}'")
+            print("AUTO_TITLE: generated='{conv.title}'")
             db.commit()
-            print(f"AUTO_TITLE: committed successfully")
+            print("AUTO_TITLE: committed successfully")
     except Exception:
         # print(f"AUTO_TITLE ERROR: {e}")
         pass

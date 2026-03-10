@@ -372,6 +372,7 @@ def semantic_search_documents(query: str, user_id: str, db, limit: int = 10) -> 
         FROM document_chunks dc
         WHERE dc.user_id = :user_id
         GROUP BY dc.document_id
+        HAVING MIN(dc.embedding <=> CAST(:embedding AS vector)) < 0.35
         ORDER BY best_distance ASC
         LIMIT :limit
     """), {

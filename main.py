@@ -20,7 +20,6 @@ IMPORTS FROM:
              create_refresh_token, get_current_user
 """
 
-import httpx
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.security import OAuth2PasswordRequestForm
 # from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials

@@ -20,11 +20,12 @@ IMPORTS FROM:
              create_refresh_token, get_current_user
 """
 
+import httpx
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.security import OAuth2PasswordRequestForm
 # from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -563,6 +564,71 @@ async def get_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+app.get("/documents/{doc_id}/file")
+async def get_document_file(
+    doc_id: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Serve raw file bytes for document viewer (PDF/TXT)."""
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if not doc.file_path:
+        # No file stored — return content as plain text
+        if doc.content:
+            return Response(
+                content=doc.content.encode("utf-8"),
+                media_type="text/plain",
+                headers={"Content-Disposition": f'inline; filename="{doc.title}.txt"'},
+            )
+        raise HTTPException(status_code=404, detail="No file available for this document")
+
+    # Fetch file from Supabase storage
+    try:
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+
+        # Build the storage URL
+        # Adjust bucket name if yours is different (common: 'documents', 'files', 'uploads')
+        file_url = f"{supabase_url}/storage/v1/object/authenticated/{doc.file_path}"
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                file_url,
+                headers={"Authorization": f"Bearer {supabase_key}"},
+                timeout=30.0,
+            )
+
+        if resp.status_code != 200:
+            # Fallback: try public bucket URL
+            file_url_public = f"{supabase_url}/storage/v1/object/public/{doc.file_path}"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(file_url_public, timeout=30.0)
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Could not fetch file from storage")
+
+        media_type = "application/pdf" if doc.file_type == "pdf" else "text/plain"
+        return Response(
+            content=resp.content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'inline; filename="{doc.title}.{doc.file_type}"',
+                "Cache-Control": "private, max-age=3600",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File fetch error: {str(e)}")
 
 @app.patch("/documents/{doc_id}", response_model=DocumentResponse)
 async def update_document(

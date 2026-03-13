@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from datetime import datetime, timedelta
 from typing import Optional
 from supabase import create_client, Client
@@ -900,6 +900,37 @@ async def restore_document_version(
 # ─────────────────────────────────────────
 # CONVERSATION ENDPOINTS
 # ─────────────────────────────────────────
+
+@app.get("/conversations/search")
+async def search_conversations(
+    q: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not q.strip():
+        return []
+    
+    query = f"%{q.lower()}%"
+    
+    # Find conversations where title OR any message content matches
+    matching_conv_ids = db.query(Message.conversation_id).filter(
+        Message.conversation_id.in_(
+            db.query(Conversation.id).filter(Conversation.user_id == current_user.id)
+        ),
+        func.lower(Message.content).like(query)
+    ).distinct().all()
+    
+    matching_conv_ids = [r[0] for r in matching_conv_ids]
+    
+    convs = db.query(Conversation).filter(
+        Conversation.user_id == current_user.id,
+        or_(
+            func.lower(Conversation.title).like(query),
+            Conversation.id.in_(matching_conv_ids)
+        )
+    ).order_by(Conversation.updated_at.desc()).all()
+    
+    return convs
 
 @app.post("/conversations", response_model=ConversationResponse, status_code=201)
 async def create_conversation(

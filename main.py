@@ -488,8 +488,7 @@ async def list_documents(
         Document.user_id == current_user.id
     ).offset(offset).limit(limit).all()
 
-# NOTE: /documents/search and /documents/semantic-search must stay
-# ABOVE /documents/{doc_id} — FastAPI matches routes top-down.
+# NOTE: specific sub-paths must stay ABOVE /documents/{doc_id} — FastAPI matches top-down.
 
 @app.get("/documents/search", response_model=list[DocumentResponse])
 async def search_documents(
@@ -901,6 +900,8 @@ async def restore_document_version(
 # CONVERSATION ENDPOINTS
 # ─────────────────────────────────────────
 
+# NOTE: /conversations/search must stay ABOVE /conversations/{conv_id} — FastAPI matches top-down.
+
 @app.get("/conversations/search")
 async def search_conversations(
     q: str,
@@ -909,19 +910,19 @@ async def search_conversations(
 ):
     if not q.strip():
         return []
-    
+
     query = f"%{q.lower()}%"
-    
-    # Find conversations where title OR any message content matches
+
+    # Find conversations where any message content matches
     matching_conv_ids = db.query(Message.conversation_id).filter(
         Message.conversation_id.in_(
             db.query(Conversation.id).filter(Conversation.user_id == current_user.id)
         ),
         func.lower(Message.content).like(query)
     ).distinct().all()
-    
+
     matching_conv_ids = [r[0] for r in matching_conv_ids]
-    
+
     convs = db.query(Conversation).filter(
         Conversation.user_id == current_user.id,
         or_(
@@ -929,7 +930,7 @@ async def search_conversations(
             Conversation.id.in_(matching_conv_ids)
         )
     ).order_by(Conversation.updated_at.desc()).all()
-    
+
     return convs
 
 @app.post("/conversations", response_model=ConversationResponse, status_code=201)
@@ -1223,6 +1224,38 @@ async def process_document_endpoint(
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
+@app.post("/documents/{doc_id}/summarize")
+@limiter.limit("10/hour")
+async def summarize_document(
+    request: Request,
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Regenerate the summary for an existing document on demand.
+    Does not require the document to be processed — only needs content.
+    Saves the new summary to the DB and returns it.
+    """
+    doc = db.query(Document).filter(
+        Document.id == doc_id,
+        Document.user_id == current_user.id
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not doc.content:
+        raise HTTPException(status_code=400, detail="Document has no content to summarize")
+
+    try:
+        summary = generate_summary(doc.content)
+        doc.summary = summary
+        db.commit()
+        return {"summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
+
+
 def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
     """
     Generate and save a conversation title after the first user message.
@@ -1234,7 +1267,6 @@ def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
             Message.conversation_id == conv.id,
             Message.role == "user"
         ).count()
-        # print("AUTO_TITLE: user_msg_count={user_msg_count}, conv_id={conv.id}")
         if user_msg_count == 1:
             doc_titles = []
             for did in doc_ids:
@@ -1244,9 +1276,7 @@ def _auto_title(conv, doc_ids: list, message_content: str, db) -> None:
             conv.title = generate_conversation_title(message_content, doc_titles)
             print(f"AUTO_TITLE: generated='{conv.title}'")
             db.commit()
-            # print("AUTO_TITLE: committed successfully")
     except Exception:
-        # print(f"AUTO_TITLE ERROR: {e}")
         pass
 
 

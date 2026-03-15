@@ -24,6 +24,9 @@ Imagine you run a library with an AI research assistant:
 - **Resend** = the postal service that delivers password reset letters
 - **Google OAuth** = letting users show their Google ID card instead of creating a new library card
 - **Share links** = a photocopy of a conversation anyone can read without a library card
+- **pdf.js** = a dedicated PDF reader built into the library's reading desk
+- **SlowAPI** = the door policy limiting how many requests one person can make per minute
+- **GitHub Actions CI** = the quality checker that runs automatically before any change goes live
 
 ---
 
@@ -239,6 +242,73 @@ Conflicts encountered and resolved:
 - resend v2 changed "to" field from string to list → [user.email]
 - google-auth 2.40.0 conflicts with cachetools==6.2.6 → downgraded cachetools to 5.5.2
 
+### pgvector HAVING Threshold for Semantic Search (Week 7)
+Similarity cutoff applied at the database query level using HAVING distance < 0.35
+(equivalent to cosine similarity > 0.65). Doing this in SQL means irrelevant documents
+never leave the database — faster and cleaner than filtering in Python after the fact.
+Threshold of 0.35 chosen empirically: strict enough to remove noise,
+loose enough to return results for imprecise queries.
+
+### Document Versioning — Snapshot Pattern (Week 7)
+Each version upload saves the current document state (content, file_path, file_type, summary)
+into a document_versions table before overwriting. This is the snapshot pattern:
+a point-in-time copy is stored, not a diff. Simpler to implement and restore than
+delta-based versioning. Restore replaces the live document with the snapshot's values
+and triggers re-processing (re-chunk + re-embed) so the AI always works from the active version.
+
+### Auto-Title via GPT on First Message (Week 7)
+Conversation titles default to the document name, which is not descriptive once
+a conversation is underway. On the first user message, a GPT call generates a
+short, meaningful title from the message content and document titles.
+Triggered only once (when title is still the default) — never overwrites a user-renamed title.
+Title update is async and non-blocking — the chat stream is unaffected.
+
+### SlowAPI for Rate Limiting (Week 7)
+SlowAPI is a thin wrapper around limits library that integrates natively with FastAPI.
+Applied per-endpoint with decorator syntax: @limiter.limit("5/minute").
+Chosen over a custom middleware because it's per-route granular — login and
+forgot-password need tighter limits than chat stream.
+Returns 429 Too Many Requests — standard HTTP status code for rate limit breach.
+
+### Two Separate Repos + Two CI Pipelines (Week 7)
+Monorepo was attempted but abandoned due to Windows git path complexity.
+Each repo has its own .github/workflows/ci.yml.
+Backend CI: Python 3.11, install requirements, import check, ruff lint.
+Frontend CI: Node 20, npm ci, TypeScript type check, build.
+This catches lint errors and type errors before they reach Render/Vercel.
+Ruff chosen over flake8/pylint — significantly faster, modern Python linter.
+
+### pdf.js over iframe/embed for PDF Rendering (Week 8)
+iframe and <embed> tags render PDFs with the browser's native viewer —
+no programmatic control over zoom, page, or scroll.
+pdf.js renders each page to a <canvas> element — full control over zoom level,
+page navigation, and fit-to-width behavior.
+Enables future features like text selection and highlight-to-ask.
+Worker loaded from unpkg (not cdnjs) to guarantee version match with npm package.
+
+### ResizableSplit via Mousedown Drag (Week 8)
+The split ratio is stored as a percentage in React state (default 50/50).
+On drag start, a mousemove listener calculates the new ratio from cursor position.
+Min 25% / max 75% clamps prevent either panel from collapsing.
+On mobile (< 768px), panels stack vertically — no drag handle shown.
+Pure CSS + event listeners, no external library needed.
+
+### Serving Files via Backend Endpoint, Not Direct Supabase URL (Week 8)
+Supabase Storage URLs can expire or require signed tokens.
+Routing file serving through GET /documents/{doc_id}/file means:
+- Auth check is enforced (only the document owner can fetch the file)
+- The frontend never needs to know the storage bucket structure
+- File serving logic is centralised and can be changed without frontend changes
+Backend downloads bytes from Supabase Python client and streams them to the browser.
+
+### Backend Conversation Search over Frontend Filter (Week 8)
+Client-side filtering on conversations only has access to titles — messages
+are not loaded on the dashboard. To search message content, a backend endpoint
+is required. GET /conversations/search queries both conversation titles and
+message content via SQL LIKE, using a subquery to find matching conversation IDs.
+400ms debounce prevents a request on every keystroke.
+Falls back to client-side title filter while the input is empty — no API call needed.
+
 ---
 
 ## Decision Log (Chronological)
@@ -283,6 +353,17 @@ Conflicts encountered and resolved:
 | W6 | Find-or-create for Google users | Unified account by email |
 | W6 | resend==2.23.0 | 0.28.0 doesn't exist |
 | W6 | cachetools==5.5.2 | google-auth 2.40.0 conflict fix |
+| W7 | pgvector HAVING threshold | SQL-level filter, faster than Python post-filter |
+| W7 | Snapshot versioning | Simpler than delta — restore = copy snapshot back |
+| W7 | Auto-title on first message | Default title not descriptive once chat starts |
+| W7 | SlowAPI for rate limiting | Per-route granular, native FastAPI integration |
+| W7 | Two repos + two CI pipelines | Monorepo blocked on Windows, CI per repo cleaner |
+| W7 | Ruff over flake8/pylint | Faster, modern, same rules |
+| W8 | pdf.js over iframe/embed | Programmatic control, enables future highlight feature |
+| W8 | ResizableSplit via drag | No library needed, pure CSS + events |
+| W8 | File serving via backend endpoint | Auth enforcement + abstraction over storage URL |
+| W8 | Backend conversation search | Client-side has no access to message content |
+| W8 | 400ms debounce on conv search | Prevents request per keystroke |
 
 ---
 
@@ -290,10 +371,12 @@ Conflicts encountered and resolved:
 | Current | Production alternative | Reason |
 |---|---|---|
 | Single main.py | FastAPI routers by domain | Maintainability |
-| No rate limiting | SlowAPI or API gateway | Abuse prevention |
+| SlowAPI in-process | API gateway rate limiting | Distributed, survives restarts |
 | allow_origins=["*"] | Explicit origin whitelist | Security |
 | limit=50 on list endpoints | Cursor-based pagination | Scalability |
 | Supabase free tier | Dedicated PostgreSQL | Connection limits |
 | Render free tier | Paid instance | No cold starts |
 | In-process streaming | Celery + Redis queue | Reliability at scale |
 | js-cookie (accessible) | httpOnly server-set cookies | XSS protection |
+| pdf.js canvas rendering | WebAssembly PDF renderer | Performance on large files |
+| Snapshot versioning | Delta/diff versioning | Storage efficiency at scale |

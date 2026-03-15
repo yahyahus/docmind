@@ -52,19 +52,41 @@ Browser ReadableStream reader receives tokens
       ↓
 React state updates on each token → live text appears
       ↓
-On done event: full response saved to DB
+On done event: full response saved to DB + conversation refetched (for auto-title)
+```
+
+## How Split-View Chat Works (Week 8)
+```
+User opens chat page
+      ↓
+ResizableSplit renders two panels (default 50/50)
+      ↓
+Left panel: chat messages + input (existing)
+Right panel: document viewer tab bar
+      ↓
+Tab selected → GET /documents/{doc_id}/file
+      ↓
+Backend downloads bytes from Supabase Storage
+      ↓
+PDF → PdfViewer (pdf.js canvas rendering)
+TXT → TxtViewer (monospace scrollable text)
+      ↓
+User drags handle → ratio updates → panels resize live
 ```
 
 ## Backend File Structure
 ```
 docmind/
-├── main.py         — All API endpoints (21+)
-├── database.py     — 7 table definitions + DB connection
+├── main.py         — All API endpoints (25+)
+├── database.py     — 8 table definitions + DB connection
 ├── auth.py         — JWT tokens + bcrypt hashing
-├── ai.py           — RAG pipeline (chunk + embed + search + re-rank + generate)
+├── ai.py           — RAG pipeline (chunk + embed + search + re-rank + generate + title)
 ├── .env            — DATABASE_URL, SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY,
 │                     RESEND_API_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FRONTEND_URL
 ├── .gitignore
+├── .github/
+│   └── workflows/
+│       └── ci.yml  — Backend CI (Python 3.11, ruff lint, import check)
 ├── render.yaml     — Render deployment config
 ├── Procfile        — Production start command
 ├── requirements.txt
@@ -90,10 +112,10 @@ docmind-frontend/
 │   ├── reset-password/
 │   │   └── page.tsx            — New password form (reads ?token= from URL)
 │   ├── dashboard/
-│   │   └── page.tsx            — Doc list, upload, tags, multi-doc select, export
+│   │   └── page.tsx            — Doc list, upload, tags, multi-doc select, conv search
 │   ├── chat/
 │   │   └── [id]/
-│   │       └── page.tsx        — Streaming chat, share modal, export dropdown
+│   │       └── page.tsx        — Split-view: streaming chat + PDF/TXT viewer
 │   ├── profile/
 │   │   └── page.tsx            — User stats + change password
 │   └── share/
@@ -102,6 +124,9 @@ docmind-frontend/
 ├── lib/
 │   ├── api.ts                  — Axios client + JWT interceptor
 │   └── wakeup.ts               — Backend ping on app load
+├── .github/
+│   └── workflows/
+│       └── ci.yml              — Frontend CI (Node 20, tsc, build)
 ├── .env.local                  — NEXT_PUBLIC_API_URL, NEXT_PUBLIC_GOOGLE_CLIENT_ID
 └── package.json
 ```
@@ -121,6 +146,8 @@ docmind-frontend/
 - OpenAI — Embeddings + chat completions
 - Resend — Transactional email (password reset)
 - google-auth — Google OAuth token verification
+- SlowAPI — Rate limiting
+- Ruff — Python linter (CI)
 - Render — Backend hosting
 
 ### Frontend
@@ -131,6 +158,7 @@ docmind-frontend/
 - js-cookie — Cookie management
 - @react-oauth/google — Google Sign-In button
 - jsPDF — Client-side PDF generation (chat export)
+- pdfjs-dist — PDF rendering in browser (split-view)
 - Vercel — Frontend hosting
 
 ## How the RAG Pipeline Works
@@ -152,9 +180,11 @@ AI answers grounded in document — no hallucination
 Response streamed token by token to browser (SSE)
       ↓
 Full response saved to DB after stream ends
+      ↓
+Auto-title generated on first message (GPT call, async)
 ```
 
-## Database Schema (7 Tables)
+## Database Schema (8 Tables)
 ```
 users:
   id, email, hashed_password, is_active, created_at
@@ -166,6 +196,10 @@ documents:
 document_chunks:
   id, document_id(FK), user_id(FK), content,
   chunk_index, embedding(vector 1536), created_at
+
+document_versions:
+  id, document_id(FK), version_number, content,
+  file_path, file_type, summary, created_at
 
 conversations:
   id, user_id(FK), document_id(FK nullable),
@@ -197,6 +231,7 @@ share_links:
 | POST | /documents | Create document | Yes |
 | GET | /documents | List documents (limit=50) | Yes |
 | GET | /documents/search | Keyword search | Yes |
+| GET | /documents/semantic-search | Semantic search (pgvector + threshold) | Yes |
 | GET | /documents/{id} | Get document | Yes |
 | PATCH | /documents/{id} | Rename / update | Yes |
 | PATCH | /documents/{id}/tags | Update tags (normalized) | Yes |
@@ -204,8 +239,13 @@ share_links:
 | POST | /documents/upload | Upload PDF/TXT | Yes |
 | POST | /documents/{id}/process | Chunk + embed + summarize | Yes |
 | GET | /documents/{id}/chunks | Debug: view chunks | Yes |
+| GET | /documents/{id}/file | Serve raw file (PDF bytes or text) | Yes |
+| POST | /documents/{id}/version | Upload new version | Yes |
+| GET | /documents/{id}/versions | List version history | Yes |
+| POST | /documents/{id}/versions/{n}/restore | Restore a version | Yes |
 | POST | /conversations | Create (single or multi-doc) | Yes |
 | GET | /conversations | List conversations | Yes |
+| GET | /conversations/search | Search by title + message content | Yes |
 | GET | /conversations/{id} | Get conversation | Yes |
 | DELETE | /conversations/{id} | Delete + messages | Yes |
 | POST | /conversations/{id}/messages | Add message (no AI) | Yes |
@@ -225,8 +265,8 @@ share_links:
 | /register | Account creation + Google OAuth |
 | /forgot-password | Send reset email |
 | /reset-password | New password form (reads ?token=) |
-| /dashboard | Document list, upload, process, tags, multi-doc select |
-| /chat/[id] | Streaming AI chat, export dropdown, share modal |
+| /dashboard | Document list, upload, process, tags, multi-doc select, conv search |
+| /chat/[id] | Split-view: streaming AI chat + PDF/TXT document viewer |
 | /profile | User stats + change password |
 | /share/[token] | Public read-only conversation (no auth) |
 
@@ -255,6 +295,12 @@ share_links:
 | Google login failing | Check GOOGLE_CLIENT_ID on Render + Vercel |
 | Summary not saving | Check SQLAlchemy model has summary column |
 | Streaming broken | Chunks are list[str] — no .content access |
+| PDF not rendering | Check pdf.js worker URL (unpkg, not cdnjs) |
+| File serving 404 | Check /documents/{id}/file route order (before /{id}) |
+| Conversation search empty | Check /conversations/search before /conversations/{id} |
+| Version not restoring | Check document_versions table exists in Supabase |
+| Rate limit 429 | SlowAPI limit hit — check @limiter.limit on endpoint |
+| CI failing | Check .github/workflows/ci.yml — ruff errors or tsc errors |
 
 ## Storage Bucket Structure
 ```
@@ -270,9 +316,14 @@ documents/
 
 ## Critical Route Order Rule (FastAPI)
 ```
-/documents/search       ← specific, must be FIRST
-/documents/upload       ← specific, must be FIRST
-/documents/{doc_id}     ← dynamic, must be LAST
+/documents/search           ← specific, must be FIRST
+/documents/semantic-search  ← specific, must be FIRST
+/documents/upload           ← specific, must be FIRST
+/documents/{doc_id}/file    ← specific sub-path, before dynamic
+/documents/{doc_id}         ← dynamic, must be LAST
+
+/conversations/search       ← specific, must be BEFORE
+/conversations/{id}         ← dynamic, must be AFTER
 ```
 
 ## Environment Variables
@@ -297,4 +348,6 @@ google-auth==2.38.0         — 2.40.0 has issues
 google-auth-oauthlib==1.2.1
 cachetools==5.5.2           — google-auth conflicts with 6.x
 pgvector==0.4.2
+slowapi==0.1.9
+pdfjs-dist                  — npm, version must match worker URL on unpkg
 ```

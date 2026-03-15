@@ -9,6 +9,8 @@
 | Week 4 | Next.js Frontend + Vercel Deploy | ✅ Complete |
 | Week 5 | Streaming + Multi-doc + UI Revamp + Auto-summary | ✅ Complete |
 | Week 6 | Performance + Export + Tags + Auth Suite + README | ✅ Complete |
+| Week 7 | Semantic Search + Doc Versioning + Auto-title + Rate Limiting + CI | ✅ Complete |
+| Week 8 | Split-View Chat (PDF/TXT viewer) + Conversation Search | ✅ Complete |
 
 ---
 
@@ -304,6 +306,89 @@ Frontend:
 
 ---
 
+### Week 7 — Semantic Search + Doc Versioning + Auto-title + Rate Limiting + CI
+**Status:** ✅ Complete
+
+**Semantic Search from Dashboard**
+- GET /documents/semantic-search?q= endpoint — embeds query, runs pgvector cosine search
+- Similarity threshold HAVING distance < 0.35 (similarity > 0.65) applied at DB level
+- Dashboard: keyword/semantic toggle with 🔤/🧠 buttons
+- Debounced 500ms — doesn't fire on every keystroke
+- Searching... indicator while request in flight
+- Results replace document list; cleared when search is empty or mode switched
+
+**Document Versioning**
+- document_versions table: id, document_id(FK), version_number, content, file_path, file_type, summary, created_at
+- POST /documents/{id}/version — saves current version, replaces content with new file
+- GET /documents/{id}/versions — returns full version history
+- POST /documents/{id}/versions/{n}/restore — restores content + file_path from that version
+- Dashboard: ↑v button (upload new version), 🕐 button (toggle history panel), Restore per version
+- Auto-reprocesses (re-chunks + re-embeds) after version upload
+
+**Auto-title for Conversations**
+- generate_conversation_title() in ai.py — GPT call: first user message + doc titles → short title
+- Called on first user message in a conversation (only when title is "New conversation" or generic)
+- Bug fixed: f-string referenced conv.title instead of new_title variable
+- Chat page refetches conversation after stream completes to pick up updated title
+
+**Rate Limiting**
+- SlowAPI added to main.py
+- Limits: POST /auth/login (5/min), POST /auth/forgot-password (3/min), POST /documents/{id}/process (10/min), POST /conversations/{id}/chat/stream (30/min)
+- 429 Too Many Requests response on breach
+
+**CI Pipelines — Two Separate Repos**
+- Monorepo abandoned (Windows git complexity)
+- Backend CI (.github/workflows/ci.yml in docmind repo): Python 3.11, install requirements, python -c "import main", ruff lint
+- Frontend CI (.github/workflows/ci.yml in docmind-frontend repo): Node 20, npm ci, tsc --noEmit, npm run build
+- Fixed ruff errors: removed unused imports (status, HTTPBearer, HTTPAuthorizationCredentials), changed == False → .is_(False), == True → .is_(True)
+- Both CIs green ✅
+
+**Roadblocks:**
+| # | Roadblock | Cause | Fix |
+|---|-----------|-------|-----|
+| 1 | Auto-title not updating | f-string used conv.title not new_title | Fixed variable reference |
+| 2 | Ruff lint failures on CI | Unused imports + bare == comparisons | Removed imports, used .is_() |
+| 3 | Monorepo git complexity | Windows path issues | Kept two separate repos |
+
+---
+
+### Week 8 — Split-View Chat + Conversation Search
+**Status:** ✅ Complete
+
+**Split-View Chat Page**
+- ResizableSplit component: drag handle between left (chat) and right (document viewer) panels
+- Min 25% / max 75% per panel; mobile stacks vertically
+- PdfViewer component: pdf.js page-by-page rendering, zoom (±0.25), pagination, fit-to-width
+- TxtViewer component: monospace scrollable text display
+- Multi-doc tab bar: switch between documents in split view when conversation has multiple docs
+- GET /documents/{doc_id}/file endpoint added to backend — serves raw PDF bytes or text content from Supabase Storage
+- All existing chat functionality preserved: streaming, export, share modal, etc.
+
+PDF.js fixes required:
+- Worker URL: unpkg.com/pdfjs-dist@{version}/build/pdf.worker.min.mjs (cdnjs had version mismatch)
+- Canvas sized explicitly in pixels, not CSS width/height
+- Fit-to-container-width with zoom multiplier
+- Canvas container: justifyContent: 'flex-start', minWidth: 0; canvas wrapped in margin:auto div for correct scroll
+- npm install pdfjs-dist in docmind-frontend
+
+**Conversation Search (Title + Message Content)**
+- GET /conversations/search?q= endpoint — searches both conversation titles AND message content via SQL LIKE
+- Query joins messages table: finds conversations where any message content contains the search term
+- OR logic: title match OR any message match
+- Dashboard Conversations tab: search input with "searching…" spinner (400ms debounce)
+- Falls back to client-side title filter while query is empty (no API call)
+- Empty state adapts: "No conversations match your search" vs "No conversations yet"
+
+**Roadblocks:**
+| # | Roadblock | Cause | Fix |
+|---|-----------|-------|-----|
+| 1 | PDF.js worker 404 | cdnjs version didn't match pdfjs-dist npm version | Switched to unpkg with dynamic version |
+| 2 | PDF canvas wrong size | CSS width/height instead of pixel dimensions | Set canvas.width/height in pixels explicitly |
+| 3 | PDF scroll broken | Canvas container flexbox issue | justifyContent: flex-start + wrapper div |
+| 4 | Conversation search only matched titles | Frontend-only filter had no message content | Added backend /conversations/search endpoint |
+
+---
+
 ## Roadblocks Master Log
 | Day | Roadblock | Time Lost | Fix |
 |-----|-----------|-----------|-----|
@@ -339,6 +424,13 @@ Frontend:
 | W6 | Email "to" field error | resend v2 needs list | [user.email] |
 | W6 | google-auth conflict | cachetools version clash | cachetools==5.5.2 |
 | W6 | google-auth too new | 2.40.0 broken | google-auth==2.38.0 |
+| W7 | Auto-title not updating | Wrong variable in f-string | Fixed to new_title |
+| W7 | Ruff lint failures | Unused imports + bare == | .is_() + import cleanup |
+| W7 | Monorepo git complexity | Windows path issues | Two separate repos |
+| W8 | PDF.js worker 404 | cdnjs version mismatch | unpkg with dynamic version |
+| W8 | PDF canvas wrong size | CSS vs pixel dimensions | Explicit canvas.width/height |
+| W8 | PDF scroll broken | Flexbox container issue | justifyContent fix + wrapper div |
+| W8 | Conv search missed messages | Frontend-only had no message data | Backend search endpoint |
 
 ---
 
@@ -361,7 +453,7 @@ Frontend:
 - [x] FastAPI route ordering rules
 - [x] Production deployment (Render)
 - [x] Environment variable management in production
-- [x] Relational data modeling (7 tables)
+- [x] Relational data modeling (8 tables)
 - [x] Foreign key relationships + cascading delete
 - [x] Text chunking with overlap
 - [x] Vector embeddings (OpenAI text-embedding-3-small)
@@ -391,13 +483,23 @@ Frontend:
 - [x] Semantic chunking (paragraph/sentence boundaries)
 - [x] Re-ranking with cosine threshold
 - [x] Dependency conflict resolution
+- [x] Semantic search endpoint with pgvector threshold
+- [x] Document versioning (upload, history, restore)
+- [x] Auto-generated conversation titles (GPT)
+- [x] Rate limiting (SlowAPI)
+- [x] GitHub Actions CI (backend + frontend)
+- [x] Ruff linting
+- [x] PDF rendering in browser (pdf.js)
+- [x] Resizable split-panel layout
+- [x] Supabase Storage file serving via backend
+- [x] Full-text conversation search (title + message content)
 
 ---
 
 ## Resume Bullets Earned
-- "Built and deployed RESTful API with FastAPI and PostgreSQL with 21+ endpoints"
+- "Built and deployed RESTful API with FastAPI and PostgreSQL with 25+ endpoints"
 - "Implemented JWT authentication with bcrypt password hashing from scratch"
-- "Designed relational database schema with 7 tables and user-scoped access using SQLAlchemy ORM"
+- "Designed relational database schema with 8 tables and user-scoped access using SQLAlchemy ORM"
 - "Built file upload pipeline for PDF/TXT with text extraction and Supabase cloud storage"
 - "Implemented full-text keyword search using PostgreSQL ILIKE queries"
 - "Deployed production backend to Render and frontend to Vercel with environment-based configuration"
@@ -408,8 +510,11 @@ Frontend:
 - "Implemented semantic chunking and re-ranking pipeline improving retrieval precision over ANN baseline"
 - "Built complete auth suite: JWT, Google OAuth, forgot/reset password via Resend email"
 - "Added document tags, chat export (MD/TXT/PDF), and shareable read-only conversation links"
+- "Built document versioning system with upload, history, and restore capabilities"
+- "Implemented rate limiting with SlowAPI and GitHub Actions CI for both frontend and backend repos"
+- "Built split-view chat page with resizable panels, PDF rendering (pdf.js), and TXT viewer"
+- "Implemented full-text conversation search across titles and message content via backend SQL"
 - "Built full-stack AI document chat application with Next.js frontend and FastAPI backend"
-- "Implemented JWT authentication flow with cookie storage and automatic token refresh"
 
 ---
 
@@ -460,6 +565,17 @@ Frontend:
 | Token entropy and why it replaces auth | Week 6 |
 | OAuth credential flow vs redirect flow | Week 6 |
 | Dependency version conflicts | Week 6 |
+| pgvector HAVING threshold for similarity cutoff | Week 7 |
+| Document versioning — snapshot pattern | Week 7 |
+| Auto-title via GPT on first message | Week 7 |
+| Rate limiting — token bucket / fixed window | Week 7 |
+| GitHub Actions CI — lint + type check + build | Week 7 |
+| Why CI catches regressions before deploy | Week 7 |
+| pdf.js worker thread architecture | Week 8 |
+| Canvas pixel dimensions vs CSS dimensions | Week 8 |
+| Resizable panels — mousedown drag pattern | Week 8 |
+| Serving binary files from Supabase Storage via backend | Week 8 |
+| Full-text search across related tables (JOIN + LIKE) | Week 8 |
 
 ---
 
@@ -482,3 +598,7 @@ Frontend:
 - resend v2 requires "to" as a list: [user.email] not user.email
 - google-auth and cachetools have a version conflict — keep cachetools==5.5.2
 - Streaming chunks are list[str] — never try .content on them
+- pdf.js worker must come from unpkg (not cdnjs) — version must match npm package exactly
+- Canvas sizing: always set canvas.width and canvas.height in pixels, not CSS
+- Rate limiting with SlowAPI: import Limiter, add state to app, use @limiter.limit decorator
+- /conversations/search must be defined BEFORE /conversations/{id} in FastAPI (route order rule)

@@ -54,23 +54,31 @@ Stage 2: exact cosine similarity recomputed in Python, results re-sorted.
 Threshold filter at 0.3 removes low-relevance results.
 Classic recall-then-precision pipeline pattern in information retrieval.
 
+### Snapshot Data Structure (Week 7)
+**Where:** document_versions table
+**Area:** DSA — Immutable Records / Persistent Data Structures
+Each version is a complete snapshot of document state at a point in time.
+Restore = copy snapshot fields back to live record.
+Simpler than delta/diff structures — O(1) restore at cost of O(n) storage.
+
 ---
 
 ## 2. Database Systems
 
 ### Relational Model
-**Where:** All 7 tables
+**Where:** All 8 tables
 **Area:** DB Systems — Relational Algebra (E.F. Codd, 1970)
 Tables, rows, columns, relationships via foreign keys.
 
 ### Entity Relationship Design
-**Where:** 7-table schema
+**Where:** 8-table schema
 **Area:** DB Systems — ER Modeling
 ```
 users (1)──documents (many)
 users (1)──conversations (many)
 conversations (1)──messages (many)
 documents (1)──document_chunks (many)
+documents (1)──document_versions (many)
 users (1)──password_reset_tokens (many)
 conversations (1)──share_links (1)
 ```
@@ -97,14 +105,16 @@ Hierarchical Navigable Small World graph for approximate nearest
 neighbor search in high-dimensional spaces.
 
 ### Pattern Matching
-**Where:** ILIKE %keyword%
+**Where:** ILIKE %keyword%, func.lower().like() in conversation search
 **Area:** DB Systems — String Operations
 SQL LIKE patterns — subset of regular expressions.
+Used in /conversations/search to match against both title and message content.
 
 ### Schema Migration
-**Where:** ALTER TABLE for new columns (is_processed, file_path, summary, document_ids etc.)
+**Where:** ALTER TABLE for new columns
 **Area:** DB Systems — Schema Evolution
 create_all never alters existing tables. DDL statements required.
+Week 7: document_versions table added, summary/file_path/file_type columns added.
 
 ### Foreign Key Constraints
 **Where:** All table relationships
@@ -123,6 +133,20 @@ ON DELETE CASCADE automates this for share_links.
 **Area:** DB Systems — Temporal Data
 Store expiry timestamp in DB, check at read time: WHERE expires_at > NOW() AND used = FALSE.
 Common pattern for invitation links, magic links, API keys.
+
+### Subquery + OR Join for Full-Text Search (Week 8)
+**Where:** GET /conversations/search
+**Area:** DB Systems — Subqueries / Set Operations
+Subquery: find all conversation IDs where any message content LIKE query.
+Outer query: WHERE title LIKE OR id IN (subquery results).
+This avoids a cartesian join while covering both tables in one query.
+
+### Threshold Filtering in SQL (Week 7)
+**Where:** GET /documents/semantic-search — HAVING distance < 0.35
+**Area:** DB Systems — Aggregate Filtering
+HAVING clause filters after the vector distance computation.
+Equivalent to WHERE but applied post-function evaluation.
+Keeps irrelevant documents out of the result set before they reach the application layer.
 
 ---
 
@@ -144,9 +168,9 @@ GET=Read, POST=Create, PATCH=Update, DELETE=Delete.
 Stateless, resource-based URLs, uniform interface.
 
 ### HTTP Status Codes
-**Where:** 200, 201, 400, 401, 404, 422, 500
+**Where:** 200, 201, 400, 401, 404, 422, 429, 500
 **Area:** Networks — HTTP
-2xx success, 4xx client error, 5xx server error.
+2xx success, 4xx client error (429 = Too Many Requests), 5xx server error.
 
 ### JSON Serialization
 **Where:** All request/response bodies
@@ -196,6 +220,21 @@ reader.read() returns {value: Uint8Array, done: bool} chunks.
 TextDecoder converts bytes to strings.
 Lines split on \n\n — each line is one SSE event.
 
+### Binary File Transfer over HTTP (Week 8)
+**Where:** GET /documents/{doc_id}/file
+**Area:** Networks — Content-Type + Binary Protocols
+PDF files served with Content-Type: application/pdf.
+TXT files served with Content-Type: text/plain.
+Backend reads bytes from Supabase Storage and streams them in the HTTP response body.
+Browser receives bytes, pdf.js decodes them into rendered pages.
+
+### Rate Limiting (Week 7)
+**Where:** SlowAPI @limiter.limit decorators
+**Area:** Networks — Traffic Management
+Fixed-window rate limiting: count requests per client IP per time window.
+429 Too Many Requests returned when limit exceeded.
+Protects login (5/min), forgot-password (3/min), process (10/min), chat/stream (30/min).
+
 ---
 
 ## 4. Operating Systems
@@ -234,6 +273,14 @@ A function that yields values lazily without loading all into memory.
 yield pauses the coroutine and sends a value to the caller.
 FastAPI's StreamingResponse consumes the generator, pushing each yield to the client.
 Memory stays constant regardless of response length.
+
+### Worker Thread Architecture (Week 8)
+**Where:** pdf.js Web Worker for PDF rendering
+**Area:** OS — Multi-threading / Web Workers
+PDF parsing is CPU-intensive — doing it on the main thread would freeze the UI.
+pdf.js offloads parsing to a Web Worker (separate OS thread).
+Main thread sends the PDF bytes; worker thread returns page data.
+Communication via postMessage — same as IPC between processes.
 
 ---
 
@@ -306,6 +353,13 @@ DocMind never sees the user's Google password.
 Mark token as used after consumption.
 Prevents same token being used twice.
 Invalidate previous tokens when new one is requested (prevents parallel races).
+
+### Rate Limiting as Security Control (Week 7)
+**Where:** SlowAPI on login, forgot-password endpoints
+**Area:** Security — Brute Force Prevention
+Without rate limiting: attacker can try millions of passwords per second.
+5 attempts per minute on /auth/login prevents automated credential stuffing.
+3 per minute on /auth/forgot-password prevents email flooding / DoS.
 
 ---
 
@@ -381,6 +435,14 @@ DocMind sends: system prompt + context chunks + last 10 messages + question.
 Per-doc retrieval (3 chunks/doc) prevents any single doc dominating the window.
 History limited to 10 messages prevents unbounded context growth.
 
+### Auto-Title Generation (Week 7)
+**Where:** generate_conversation_title() in ai.py
+**Area:** ML — Text Summarization / Prompt Engineering
+Given the first user message and document titles, GPT generates a short descriptive title.
+Prompt engineering: constrain output to ≤6 words, no quotes, no punctuation.
+Triggered once per conversation on the first user message.
+Improves UX by replacing generic titles like "New conversation" with meaningful ones.
+
 ---
 
 ## 7. Software Engineering
@@ -423,9 +485,10 @@ Cross-cutting concerns (auth headers, error handling) in one place.
 Every request goes through interceptor automatically.
 
 ### Component-Based Architecture
-**Where:** Next.js pages as React components
+**Where:** Next.js pages as React components, ResizableSplit + PdfViewer + TxtViewer
 **Area:** SE — Component Architecture
 UI as composable, reusable, isolated units with local state.
+Week 8: split-view built from three independent components composed together.
 
 ### Backwards Compatibility (Week 5)
 **Where:** document_id kept alongside document_ids
@@ -440,12 +503,44 @@ Critical when evolving a schema with existing production data.
 System never completely fails — provides best available result.
 Instead of returning empty on low confidence, returns top results with caveat.
 
+### Continuous Integration (Week 7)
+**Where:** .github/workflows/ci.yml in both repos
+**Area:** SE — CI/CD
+Every push triggers automated checks: lint, type check, build.
+Catches regressions before they reach Render/Vercel.
+Backend CI: ruff lint + python -c "import main" (import sanity check).
+Frontend CI: tsc --noEmit (type check) + npm run build (build verification).
+Fail fast principle: broken code never reaches production.
+
+### Linting as Code Quality Gate (Week 7)
+**Where:** Ruff in backend CI
+**Area:** SE — Code Quality
+Static analysis catches unused imports, bare comparisons, style violations.
+Fixed: unused imports (status, HTTPBearer), == False/True → .is_(False/.is_(True).
+Automated enforcement means no manual code review needed for style issues.
+
+### Debounce Pattern (Week 8)
+**Where:** Conversation search input (400ms), semantic search (500ms)
+**Area:** SE — Performance / UX Engineering
+Without debounce: every keystroke fires an API call — noisy, expensive.
+With debounce: waits N ms after last keystroke before firing.
+Implemented with setTimeout + cleanup in useEffect return function.
+Standard pattern for search-as-you-type inputs.
+
+### Canvas Rendering Pipeline (Week 8)
+**Where:** PdfViewer component using pdf.js
+**Area:** SE — Graphics / Browser APIs
+pdf.js returns a page object → getViewport(scale) → render to OffscreenCanvas.
+Scale calculated from container width to achieve fit-to-width.
+Zoom multiplier applied on top: effectiveScale = fitScale * zoom.
+Re-render triggered on page change or zoom change via useEffect dependency array.
+
 ---
 
 ## 8. Theory of Computation
 
 ### Pattern Matching
-**Where:** ILIKE %keyword% search, sentence boundary regex
+**Where:** ILIKE %keyword%search, sentence boundary regex, conversation search LIKE
 **Area:** ToC — Formal Languages
 SQL LIKE = subset of regular expressions = finite automata recognizable.
 re.split(r'(?<=[.!?])\s+(?=[A-Z])') — lookbehind + lookahead assertions.
@@ -456,6 +551,7 @@ re.split(r'(?<=[.!?])\s+(?=[A-Z])') — lookbehind + lookahead assertions.
 Document: unprocessed → processed → deleted.
 Reset token: active → used / active → expired.
 HTTP lifecycle: request → processing → response.
+Version: v1 → v2 → v3 (monotonically increasing, immutable history).
 
 ### One-Way Functions
 **Where:** bcrypt, SHA-256, HMAC
@@ -474,15 +570,15 @@ HNSW approximates nearest neighbor efficiently in high dimensions.
 ## Concept Count by Area
 | CS Area | Concepts Applied |
 |---------|----------------|
-| Data Structures & Algorithms | 8 |
-| Database Systems | 11 |
-| Computer Networks | 12 |
-| Operating Systems | 6 |
-| Security & Cryptography | 11 |
-| AI & Machine Learning | 10 |
-| Software Engineering | 10 |
+| Data Structures & Algorithms | 9 |
+| Database Systems | 13 |
+| Computer Networks | 14 |
+| Operating Systems | 7 |
+| Security & Cryptography | 12 |
+| AI & Machine Learning | 11 |
+| Software Engineering | 13 |
 | Theory of Computation | 4 |
-| **Total** | **72** |
+| **Total** | **83** |
 
 ---
 
@@ -542,3 +638,25 @@ Browser sends this to our backend's POST /auth/google.
 We verify the signature using Google's public keys via google.oauth2.id_token.verify_oauth2_token().
 If valid, we extract the email, find or create the user, and return our own JWT.
 Google never sees our backend — we just trust the token's signature.
+
+### "How does your document versioning work?" (Week 7)
+Before overwriting a document with a new upload, we snapshot the current state
+into a document_versions table: content, file_path, file_type, summary, version_number.
+Restore copies the snapshot's fields back to the live document and triggers re-processing
+so the AI always works from the active version's chunks and embeddings.
+This is the snapshot pattern — simple to implement and O(1) restore.
+
+### "How does your CI pipeline work?" (Week 7)
+Two GitHub Actions workflows, one per repo.
+Backend: install Python 3.11 deps, run ruff lint, run python -c "import main" to catch import errors.
+Frontend: install Node 20 deps, run tsc --noEmit to type check, run npm run build.
+Every push to any branch triggers the CI. A red CI means the PR/commit broke something.
+Caught real bugs: unused imports, bare == False comparisons that ruff flagged.
+
+### "How did you build the PDF viewer?" (Week 8)
+Used pdf.js, which renders PDF pages to HTML canvas elements.
+The worker thread (Web Worker) handles CPU-intensive PDF parsing off the main thread.
+Fit-to-width is computed by dividing the container pixel width by the PDF's natural width.
+Zoom is applied as a multiplier on top: effectiveScale = fitScale × zoomLevel.
+Canvas width and height must be set in pixels — CSS dimensions alone don't work.
+Worker URL must match the exact npm package version; cdnjs had a mismatch so we use unpkg.

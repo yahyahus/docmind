@@ -45,7 +45,7 @@ import secrets
 
 from ai import (
     process_document, generate_rag_response, generate_summary,
-    client, find_relevant_chunks, find_relevant_chunks_multi,
+    client, find_relevant_chunks, find_relevant_chunks_multi, find_relevant_chunks_multi_with_sources,
     get_conversation_history, build_messages,
     semantic_search_documents, generate_conversation_title
 )
@@ -1403,12 +1403,18 @@ async def chat_stream(
             db=db
         )
     else:
-        chunks = find_relevant_chunks_multi(
-            question=message.content,
-            user_id=current_user.id,
-            document_ids=doc_ids,
-            db=db
+        # Build title map for source attribution
+        doc_title_map = {}
+        for did in doc_ids:
+            d = db.query(Document).filter(Document.id == did).first()
+            if d:
+                doc_title_map[did] = d.title
+        result = find_relevant_chunks_multi_with_sources(
+            question=message.content, user_id=current_user.id,
+            document_ids=doc_ids, doc_titles=doc_title_map, db=db
         )
+        chunks = result["chunks"]
+        sources = result["sources"]
 
     context = "\n\n---\n\n".join(chunks) if chunks else "No relevant context found."
     history = get_conversation_history(conv_id, db)
@@ -1440,7 +1446,8 @@ async def chat_stream(
             db.add(assistant_message)
             conv.updated_at = datetime.utcnow()
             db.commit()
-            yield f"data: {json.dumps({'done': True, 'id': assistant_id})}\n\n"
+            # Emit sources in done event for frontend attribution
+            yield f"data: {json.dumps({'done': True, 'id': assistant_id, 'sources': sources})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"

@@ -259,6 +259,33 @@ def find_relevant_chunks_multi(
         all_chunks.extend(chunks)
     return all_chunks
 
+def find_relevant_chunks_multi_with_sources(
+    question: str,
+    user_id: str,
+    document_ids: list,
+    doc_titles: dict,
+    db,
+    limit_per_doc: int = 3
+) -> dict:
+    """
+    Find relevant chunks across multiple documents.
+    Returns {"chunks": [...], "sources": ["Doc A", "Doc B"]}.
+    doc_titles: {document_id: title}
+    Only includes a doc in sources if it actually returned chunks.
+    """
+    all_chunks = []
+    sources = []
+    for document_id in document_ids:
+        chunks = find_relevant_chunks(
+            question=question, user_id=user_id,
+            document_id=document_id, db=db, limit=limit_per_doc
+        )
+        if chunks:
+            all_chunks.extend(chunks)
+            title = doc_titles.get(document_id, document_id)
+            if title not in sources:
+                sources.append(title)
+    return {"chunks": all_chunks, "sources": sources}
 
 # ─────────────────────────────────────────
 # CONVERSATION HISTORY HELPER

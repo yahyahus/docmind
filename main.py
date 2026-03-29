@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from datetime import datetime, timedelta
 from typing import Optional
 from supabase import create_client, Client
@@ -454,6 +454,72 @@ async def get_stats(
         "member_since": current_user.created_at,
     }
 
+@app.get("/auth/stats/history")
+async def get_stats_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Returns daily counts for the last 30 days:
+    - messages sent per day
+    - documents uploaded per day
+    Also returns file type breakdown (pdf vs txt).
+    """
+    from sqlalchemy import cast, Date as SADate
+    from datetime import date, timedelta
+ 
+    today = date.today()
+    thirty_days_ago = today - timedelta(days=29)
+ 
+    # Daily message counts (user messages only, from user's conversations)
+    msg_rows = db.execute(text("""
+        SELECT DATE(m.created_at) as day, COUNT(*) as cnt
+        FROM messages m
+        JOIN conversations c ON m.conversation_id = c.id
+        WHERE c.user_id = :user_id
+          AND m.role = 'user'
+          AND DATE(m.created_at) >= :since
+        GROUP BY DATE(m.created_at)
+        ORDER BY day ASC
+    """), {"user_id": current_user.id, "since": str(thirty_days_ago)}).fetchall()
+ 
+    # Daily document upload counts
+    doc_rows = db.execute(text("""
+        SELECT DATE(created_at) as day, COUNT(*) as cnt
+        FROM documents
+        WHERE user_id = :user_id
+          AND DATE(created_at) >= :since
+        GROUP BY DATE(created_at)
+        ORDER BY day ASC
+    """), {"user_id": current_user.id, "since": str(thirty_days_ago)}).fetchall()
+ 
+    # File type breakdown
+    type_rows = db.execute(text("""
+        SELECT file_type, COUNT(*) as cnt
+        FROM documents
+        WHERE user_id = :user_id
+        GROUP BY file_type
+    """), {"user_id": current_user.id}).fetchall()
+ 
+    # Build full 30-day arrays (0 for days with no activity)
+    msg_map = {str(r[0]): r[1] for r in msg_rows}
+    doc_map = {str(r[0]): r[1] for r in doc_rows}
+ 
+    days = []
+    messages_per_day = []
+    docs_per_day = []
+    for i in range(30):
+        d = str(thirty_days_ago + timedelta(days=i))
+        days.append(d)
+        messages_per_day.append(msg_map.get(d, 0))
+        docs_per_day.append(doc_map.get(d, 0))
+ 
+    type_breakdown = {str(r[0]): r[1] for r in type_rows}
+ 
+    return {
+        "days": days,
+        "messages_per_day": messages_per_day,
+        "docs_per_day": docs_per_day,
+        "pdf_count": type_breakdown.get("pdf", 0),
+        "txt_count": type_breakdown.get("txt", 0),
+    }
 
 # ─────────────────────────────────────────
 # DOCUMENT ENDPOINTS

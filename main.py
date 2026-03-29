@@ -462,7 +462,7 @@ async def get_stats_history(db: Session = Depends(get_db), current_user: User = 
     - documents uploaded per day
     Also returns file type breakdown (pdf vs txt).
     """
-    from sqlalchemy import cast, Date as SADate
+    # from sqlalchemy import cast, Date as SADate
     from datetime import date, timedelta
  
     today = date.today()
